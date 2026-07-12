@@ -47,7 +47,35 @@ python -m pytest tests/ -v                                  # run unit tests
   workers drain one shared request budget, so workers started immediately
   exhaust it before staggered ones ever wake up — the ramp silently never
   happens. `build_config_from_args` rejects the combination outright rather
-  than silently ignoring `--ramp-up`.
+  than silently ignoring `--ramp-up`. It must also be strictly less than
+  `-d`/`--duration` (also rejected otherwise) — the ramp would still be
+  staggering workers in when the run ends.
+- **`-c`/`--concurrency` is a hard ceiling by itself** — `--ramp-up` only
+  staggers the *start times* of exactly `-c` workers; concurrency plateaus at
+  `-c` once they've all started and never climbs further, no matter how long
+  `--duration` runs. To actually climb toward thousands/tens-of-thousands of
+  req/s, add `--max-concurrency <N>`: the ramp then starts at `-c` (still the
+  floor - see `ramp_delays_from_floor`) and climbs toward `N` instead of
+  plateauing (and the `aiohttp.TCPConnector` limit in `LoadGenerator.run`
+  tracks `N`, not `-c`, so connections aren't silently throttled back down).
+  If `--ramp-up` isn't given explicitly alongside `--max-concurrency`, it
+  defaults to ~90% of `--duration` so the climb is still in progress near the
+  end rather than flattening out early; an explicit `--ramp-up 0` with
+  `--max-concurrency` is rejected, since that would slam every worker up to
+  `N` on instantly instead of ramping.
+- **Very high `--max-concurrency` can make the *client* look like the
+  breaking point, not the target** — on Windows especially, ephemeral ports
+  (~16k by default) and TIME_WAIT exhaust well before tens of thousands of
+  concurrent connections. `build_report` distinguishes this in the report:
+  `stats.error_counts` holds only exceptions (timeouts, connection errors),
+  while real server 5xx responses land in `stats.status_counts` instead - if
+  non-timeout exceptions outnumber 5xx responses at the breaking point, a
+  caveat line is appended pointing at client-side resource exhaustion instead
+  of the target actually failing.
+- `--stop-on-break` makes `_progress_reporter` call `find_breaking_point` on
+  the live buckets once a second and set `_stop_event` as soon as it fires,
+  ending the run early instead of continuing to hammer an already-broken
+  target for the rest of `--duration`/`--requests`.
 - `normalize_url` deliberately does not use `urlparse().scheme` to detect
   whether a scheme is present — `urlparse("localhost:8080")` misreads
   `localhost` as the scheme, so the common homelab `host:port` case would

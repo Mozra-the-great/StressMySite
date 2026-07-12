@@ -14,6 +14,10 @@ many browser tabs Chrome can render.
 Usage examples:
     python stress_my_site.py --url https://example.com -c 50 -n 5000
     python stress_my_site.py --url http://localhost:8080 -c 100 -d 30 --ramp-up 20
+    # Keep climbing from 100 up to 20,000 concurrent connections across the
+    # whole 5-minute run, stopping as soon as a breaking point is detected:
+    python stress_my_site.py --url http://localhost:8080 -c 100 -d 300 \
+        --max-concurrency 20000 --stop-on-break
     python stress_my_site.py            # interactive prompts for everything
 
 IMPORTANT: Only point this at systems you own or are explicitly authorized to
@@ -104,6 +108,27 @@ def ramp_delays(concurrency: int, ramp_seconds: float) -> list[float]:
         return [0.0]
     step = ramp_seconds / (concurrency - 1)
     return [i * step for i in range(concurrency)]
+
+
+def ramp_delays_from_floor(floor: int, peak: int, ramp_seconds: float) -> list[float]:
+    """Like `ramp_delays`, but the first `floor` workers start immediately
+    (delay 0.0) and only the remaining `peak - floor` workers stagger in,
+    reaching `peak` by `ramp_seconds`.
+
+    Used for a continuous ramp toward `--max-concurrency`: the run should
+    start at `-c`/`--concurrency` (the floor) rather than climbing from
+    scratch, so `-c` keeps meaning "starting concurrency" instead of being
+    silently ignored once a higher ceiling is in play.
+    """
+    if floor <= 0:
+        raise ValueError("floor must be positive")
+    if peak < floor:
+        raise ValueError("peak must be >= floor")
+    extra = peak - floor
+    if extra == 0 or ramp_seconds <= 0:
+        return [0.0] * peak
+    step = ramp_seconds / extra
+    return [0.0] * floor + [(i + 1) * step for i in range(extra)]
 
 
 @dataclass
@@ -289,6 +314,22 @@ def build_report(stats: RunStats, breaking_point: Optional[BreakingPoint]) -> st
             f"  Failure rate at that point: {breaking_point.failure_rate:.1%}"
             + (f", p95 latency: {breaking_point.p95_latency:.3f}s" if breaking_point.p95_latency else "")
         )
+        # `error_counts` holds only exceptions (timeouts, connection errors) -
+        # actual server 5xx responses land in `status_counts` instead. If
+        # non-timeout exceptions dominate over real 5xx responses, the
+        # "failure" more likely reflects the client running out of its own
+        # resources (ephemeral ports, file descriptors) than the target
+        # actually breaking - most relevant at very high --max-concurrency.
+        connection_errors = sum(count for kind, count in stats.error_counts.items() if kind != "timeout")
+        server_5xx = sum(count for code, count in stats.status_counts.items() if code >= 500)
+        if connection_errors > 0 and connection_errors > server_5xx:
+            lines.append(
+                f"  Caveat: {connection_errors} client-side connection errors vs. "
+                f"{server_5xx} server 5xx responses - this may reflect the client "
+                "(ephemeral ports, open file descriptors) hitting its own limit "
+                "rather than the target actually failing. See README's 'A note "
+                "on limits'."
+            )
     else:
         lines.append("No breaking point detected - target held up under the applied load.")
     lines.append("=" * 60)
@@ -334,6 +375,8 @@ class RunConfig:
     total_requests: Optional[int] = None  # count mode
     duration: Optional[float] = None  # duration mode
     ramp_up: float = 0.0
+    max_concurrency: Optional[int] = None  # if set, ramp climbs to this instead of plateauing at `concurrency`
+    stop_on_break: bool = False  # end the run early once a breaking point is detected
     timeout: float = 10.0
     verify_tls: bool = True
     rps: Optional[float] = None  # optional global rate limit
@@ -432,15 +475,36 @@ class LoadGenerator:
             print(
                 f"[progress] t={time.monotonic() - self._start_time:5.1f}s  "
                 f"requests={current}  (+{current - last_count}/s)  "
-                f"errors={self.stats.errors}",
+                f"active={self._active_workers}  errors={self.stats.errors}",
                 file=sys.stderr,
             )
             last_count = current
+            if self.config.stop_on_break:
+                bp = find_breaking_point(self.stats.buckets)
+                if bp is not None:
+                    print(
+                        f"[stop-on-break] breaking point detected at t={bp.bucket_index}s "
+                        f"(active load ~{bp.active_load}) - stopping early",
+                        file=sys.stderr,
+                    )
+                    self._stop_event.set()
+                    return
 
     async def run(self) -> None:
-        connector = aiohttp.TCPConnector(limit=self.config.concurrency, ssl=self.config.verify_tls)
+        # When --max-concurrency is set, the ramp starts at `concurrency`
+        # (the floor - the historical meaning of `-c`) and climbs toward
+        # `max_concurrency` instead of plateauing at `concurrency` forever.
+        # The connector limit must track whichever value workers can
+        # actually reach, or connections throttle back down to the old
+        # ceiling regardless of how many workers exist.
+        if self.config.max_concurrency:
+            peak_concurrency = self.config.max_concurrency
+            delays = ramp_delays_from_floor(self.config.concurrency, peak_concurrency, self.config.ramp_up)
+        else:
+            peak_concurrency = self.config.concurrency
+            delays = ramp_delays(peak_concurrency, self.config.ramp_up)
+        connector = aiohttp.TCPConnector(limit=peak_concurrency, ssl=self.config.verify_tls)
         timeout = aiohttp.ClientTimeout(total=self.config.timeout)
-        delays = ramp_delays(self.config.concurrency, self.config.ramp_up)
 
         self._start_time = time.monotonic()
         if self.config.duration is not None:
@@ -498,7 +562,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("-c", "--concurrency", type=int, help="Number of concurrent connections")
     parser.add_argument("-n", "--requests", type=int, help="Total number of requests to send")
     parser.add_argument("-d", "--duration", type=float, help="Duration in seconds to sustain load")
-    parser.add_argument("--ramp-up", type=float, default=0.0, help="Seconds to linearly ramp up to full concurrency (default: 0)")
+    parser.add_argument("--ramp-up", type=float, default=None, help="Seconds to linearly ramp concurrency up (default: 0, i.e. full concurrency instantly; defaults to ~90%% of --duration if --max-concurrency is given)")
+    parser.add_argument("--max-concurrency", type=int, default=None, help="Ceiling to continuously ramp concurrency up to over the run, instead of plateauing at -c/--concurrency once the ramp finishes (requires --duration; use this to push toward tens of thousands of req/s)")
+    parser.add_argument("--stop-on-break", action="store_true", help="End the run as soon as a breaking point is detected, instead of running for the full --duration/--requests regardless")
     parser.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout in seconds (default: 10)")
     parser.add_argument("--method", default="GET", help="HTTP method to use (default: GET)")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification")
@@ -534,7 +600,38 @@ def build_config_from_args(args: argparse.Namespace) -> RunConfig:
     if duration is not None and duration <= 0:
         raise ValueError("--duration must be a positive number of seconds")
 
-    ramp_up = args.ramp_up
+    max_concurrency = args.max_concurrency
+    if max_concurrency is not None:
+        if total_requests is not None:
+            raise ValueError(
+                "--max-concurrency is only supported together with --duration, not "
+                "--requests: it needs a time window to ramp across. Use --duration instead."
+            )
+        if max_concurrency <= concurrency:
+            raise ValueError(
+                f"--max-concurrency ({max_concurrency}) must be greater than "
+                f"-c/--concurrency ({concurrency}) - it's the ceiling the ramp climbs "
+                "toward, not the starting point."
+            )
+        if args.ramp_up is not None and args.ramp_up <= 0:
+            raise ValueError(
+                "--max-concurrency needs a positive --ramp-up to climb across "
+                "(or omit --ramp-up to use the ~90%-of-duration default) - "
+                "otherwise every --max-concurrency worker starts at once instead "
+                "of ramping in."
+            )
+
+    ramp_up_arg = args.ramp_up
+    if ramp_up_arg is None:
+        # No explicit --ramp-up: default to ramping across (almost) the whole
+        # run when --max-concurrency is set (that's the point of a continuous
+        # climb) - leave a 10% tail at full concurrency rather than ramping
+        # right up to the deadline, otherwise the top of the climb barely
+        # gets a chance to send anything. Otherwise keep the historical
+        # default of no ramp at all.
+        ramp_up = duration * 0.9 if (max_concurrency is not None and duration is not None) else 0.0
+    else:
+        ramp_up = ramp_up_arg
     if ramp_up < 0:
         raise ValueError("--ramp-up must not be negative")
     if ramp_up > 0 and total_requests is not None:
@@ -543,6 +640,12 @@ def build_config_from_args(args: argparse.Namespace) -> RunConfig:
             "in count mode, workers started immediately drain the shared request "
             "budget before staggered workers get a chance to start, so the ramp "
             "never actually happens. Use --duration instead."
+        )
+    if ramp_up_arg is not None and ramp_up > 0 and duration is not None and ramp_up >= duration:
+        raise ValueError(
+            f"--ramp-up ({ramp_up}s) must be less than --duration ({duration}s) - "
+            "otherwise workers are still staggering in when the run ends and the "
+            "ramp never reaches full concurrency."
         )
 
     if args.timeout <= 0:
@@ -557,6 +660,8 @@ def build_config_from_args(args: argparse.Namespace) -> RunConfig:
         total_requests=total_requests,
         duration=duration,
         ramp_up=ramp_up,
+        max_concurrency=max_concurrency,
+        stop_on_break=args.stop_on_break,
         timeout=args.timeout,
         verify_tls=not args.insecure,
         rps=args.rps,
