@@ -24,6 +24,7 @@ from stress_my_site import (  # noqa: E402
     parse_args,
     percentile,
     ramp_delays,
+    ramp_delays_from_floor,
 )
 
 
@@ -98,6 +99,34 @@ class TestRampDelays:
     def test_zero_concurrency_raises(self):
         with pytest.raises(ValueError):
             ramp_delays(0, 10)
+
+
+class TestRampDelaysFromFloor:
+    def test_floor_workers_start_immediately(self):
+        delays = ramp_delays_from_floor(5, 20, 30)
+        assert delays[:5] == [0.0] * 5
+
+    def test_extra_workers_stagger_up_to_ramp_seconds(self):
+        delays = ramp_delays_from_floor(5, 20, 30)
+        extra = delays[5:]
+        assert len(extra) == 15
+        assert extra == sorted(extra)
+        assert extra[-1] == 30.0
+        assert extra[0] > 0.0
+
+    def test_no_extra_workers_all_start_immediately(self):
+        assert ramp_delays_from_floor(10, 10, 30) == [0.0] * 10
+
+    def test_zero_ramp_seconds_all_start_immediately(self):
+        assert ramp_delays_from_floor(5, 20, 0) == [0.0] * 20
+
+    def test_peak_below_floor_raises(self):
+        with pytest.raises(ValueError):
+            ramp_delays_from_floor(20, 5, 30)
+
+    def test_zero_floor_raises(self):
+        with pytest.raises(ValueError):
+            ramp_delays_from_floor(0, 20, 30)
 
 
 class TestFindBreakingPoint:
@@ -247,6 +276,63 @@ class TestBuildConfigValidation:
         args = parse_args(["--url", "localhost:8080", "-c", "5", "-n", "100", "-y"])
         config = build_config_from_args(args)
         assert config.url == "https://localhost:8080"
+
+    def test_explicit_ramp_up_at_or_past_duration_raises(self):
+        args = parse_args(["--url", "https://example.com", "-c", "5", "-d", "10", "--ramp-up", "10", "-y"])
+        with pytest.raises(ValueError, match="must be less than --duration"):
+            build_config_from_args(args)
+
+        args = parse_args(["--url", "https://example.com", "-c", "5", "-d", "10", "--ramp-up", "15", "-y"])
+        with pytest.raises(ValueError, match="must be less than --duration"):
+            build_config_from_args(args)
+
+    def test_explicit_ramp_up_just_below_duration_is_allowed(self):
+        args = parse_args(["--url", "https://example.com", "-c", "5", "-d", "10", "--ramp-up", "9.9", "-y"])
+        config = build_config_from_args(args)
+        assert config.ramp_up == 9.9
+
+    def test_max_concurrency_with_requests_raises(self):
+        args = parse_args(["--url", "https://example.com", "-c", "5", "-n", "100", "--max-concurrency", "500", "-y"])
+        with pytest.raises(ValueError, match="only supported together with --duration"):
+            build_config_from_args(args)
+
+    def test_max_concurrency_not_greater_than_concurrency_raises(self):
+        args = parse_args(["--url", "https://example.com", "-c", "500", "-d", "10", "--max-concurrency", "500", "-y"])
+        with pytest.raises(ValueError, match="must be greater than"):
+            build_config_from_args(args)
+
+        args = parse_args(["--url", "https://example.com", "-c", "500", "-d", "10", "--max-concurrency", "100", "-y"])
+        with pytest.raises(ValueError, match="must be greater than"):
+            build_config_from_args(args)
+
+    def test_max_concurrency_defaults_ramp_up_across_most_of_duration(self):
+        args = parse_args(["--url", "https://example.com", "-c", "10", "-d", "100", "--max-concurrency", "5000", "-y"])
+        config = build_config_from_args(args)
+        assert config.max_concurrency == 5000
+        assert config.ramp_up == pytest.approx(90.0)
+
+    def test_max_concurrency_with_explicit_ramp_up_is_respected(self):
+        args = parse_args([
+            "--url", "https://example.com", "-c", "10", "-d", "100",
+            "--max-concurrency", "5000", "--ramp-up", "50", "-y",
+        ])
+        config = build_config_from_args(args)
+        assert config.ramp_up == 50.0
+
+    def test_max_concurrency_with_zero_ramp_up_raises(self):
+        args = parse_args([
+            "--url", "https://example.com", "-c", "10", "-d", "100",
+            "--max-concurrency", "5000", "--ramp-up", "0", "-y",
+        ])
+        with pytest.raises(ValueError, match="needs a positive --ramp-up"):
+            build_config_from_args(args)
+
+    def test_stop_on_break_flag_defaults_false_and_can_be_enabled(self):
+        args = parse_args(["--url", "https://example.com", "-c", "5", "-n", "100", "-y"])
+        assert build_config_from_args(args).stop_on_break is False
+
+        args = parse_args(["--url", "https://example.com", "-c", "5", "-n", "100", "--stop-on-break", "-y"])
+        assert build_config_from_args(args).stop_on_break is True
 
 
 class TestBuildReport:
