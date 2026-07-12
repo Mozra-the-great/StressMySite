@@ -27,6 +27,14 @@ dist/
 build/
 coverage/
 
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
 # Logs
 *.log
 logs/
