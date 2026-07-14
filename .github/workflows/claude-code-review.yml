@@ -51,6 +51,5 @@ jobs:
           # completing "successfully"). Bash/Read/Grep/Glob are what the
           # skill needs once it's actually running to inspect the diff.
           claude_args: '--allowedTools Skill,Bash,Read,Grep,Glob'
-          show_full_output: true # temporary - confirming the Skill-tool fix actually works end to end
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
