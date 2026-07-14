@@ -35,11 +35,13 @@ python -m pytest tests/ -v                                         # run unit te
   ramps past the breaking point, then holds the target down for a fixed,
   user-chosen `--minutes`, escalating concurrency whenever it recovers, so the
   operator can watch their own defenses react - it always stops automatically
-  after `--minutes` (never unbounded; see the dedicated `takedown` note
-  below for why that boundary is load-bearing, not incidental). There is no
-  flat/count mode (`-n`) or top-level `--rps` cap/`--stop-on-break`/
-  `--ramp-up` anymore — those were dropped in the mode-based rewrite; see
-  `README.md` for the full flag tables per mode. `--rps` (a global rate
+  after `--minutes` (the *time* bound is never optional; see the dedicated
+  `takedown` note below for why that boundary is load-bearing, not
+  incidental - concurrency itself is a separate, genuinely optional bound,
+  see that same note). There is no flat/count mode (`-n`) or top-level
+  `--rps` cap/`--stop-on-break`/`--ramp-up` anymore — those were dropped in
+  the mode-based rewrite; see `README.md` for the full flag tables per mode.
+  `--rps` (a global rate
   limiter, `TokenBucketLimiter`) still exists, but only on `break` — it
   fights the `requests`-mode controller's own throughput-driven ramp, so
   it's not exposed there.
@@ -81,12 +83,21 @@ python -m pytest tests/ -v                                         # run unit te
   just the hold window's buckets to produce the sustained/not-sustained
   verdict.
 - **`-c`/`--concurrency` is the ramp floor, `--max-concurrency` is the
-  ceiling** in all three modes - always set (auto-defaulted if the user omits
-  it): `default_break_max_concurrency` (200x `-c`) for `break` and `takedown`,
+  ceiling** in `break`/`requests` - always set there (auto-defaulted if the
+  user omits it): `default_break_max_concurrency` (200x `-c`) for `break`,
   `default_requests_max_concurrency` (a rough `--target-rps`-derived estimate,
-  assuming ~50 req/s/worker with 3x headroom) for `requests`. All defaults
+  assuming ~50 req/s/worker with 3x headroom) for `requests`. Both defaults
   are printed at run start along with the assumption behind them, and are
-  always overridable.
+  always overridable. `RunConfig.max_concurrency` is typed `Optional[int]`
+  specifically because `takedown` breaks this pattern: it has no default
+  ceiling at all (`None` unless the user passes `--max-concurrency`
+  explicitly) - see the dedicated `takedown` note below. `takedown`'s
+  *initial ramp* still needs a concrete finite target to schedule delays
+  against though, so `LoadGenerator._run_takedown` falls back to
+  `default_break_max_concurrency` for that specific purpose regardless of
+  whether the hold-phase escalation ceiling is set - two different concepts
+  that happen to share a name-shaped role (`ramp_ceiling` vs. `ceiling` in
+  that function).
 - **Very high `--max-concurrency` can make the *client* look like the
   breaking point, not the target** — on Windows especially, ephemeral ports
   (~16k by default) and TIME_WAIT exhaust well before tens of thousands of
@@ -102,22 +113,35 @@ python -m pytest tests/ -v                                         # run unit te
   `-d`/`--duration` (default 300s) is just the outer safety cap in case the
   target never breaks.
 - **`takedown` mode (`LoadGenerator._run_takedown`) exists specifically as a
-  *bounded* alternative to an earlier, rejected unbounded design.** The
-  original ask was "keep the server down indefinitely, escalate whenever it
-  recovers, stop only manually" — that's a recovery-defeating denial-of-service
-  primitive with no measurement or stop condition, not a load test, and was
-  refused as such (see project history/PR discussion). What's implemented
-  instead: ramp like `break` until a breaking point, freeze concurrency at
-  exactly that level (cancelling any not-yet-started ramp workers via
-  `worker.cancel()` so it doesn't keep climbing past the break), then hold for
-  a **mandatory, user-supplied `--minutes`**, escalating via
-  `escalate_concurrency` (+25%/step, always advances by >=1, clamped to
-  `--max-concurrency`) each time `find_breaking_point` on the trailing 5
-  buckets returns `None` (i.e. no sustained badness recently = "recovered").
-  It always stops automatically once the hold window elapses; there is
-  intentionally no flag or code path to make the hold unbounded. If asked to
-  remove or bypass that automatic stop, don't — surface the request instead,
-  same reasoning as the original refusal.
+  *time-bounded* alternative to an earlier, rejected fully-unbounded design —
+  this distinction is load-bearing and has two independent axes, don't
+  conflate them.** The original ask was "keep the server down indefinitely,
+  escalate whenever it recovers, stop only manually" — that's a
+  recovery-defeating denial-of-service primitive with no measurement or stop
+  condition, not a load test, and was refused as such (see project
+  history/PR discussion). What's implemented instead: ramp like `break`
+  until a breaking point, freeze concurrency at exactly that level
+  (cancelling any not-yet-started ramp workers via `worker.cancel()` so it
+  doesn't keep climbing past the break), then hold for a **mandatory,
+  user-supplied `--minutes`** - `RunConfig.takedown_minutes` has no default
+  and `build_config_from_args` always prompts/requires it. During the hold,
+  `escalate_concurrency` (+25%/step, always advances by >=1) is applied each
+  time `find_breaking_point` on the trailing 5 buckets returns `None` (i.e.
+  no sustained badness recently = "recovered"). The run always stops
+  automatically once the hold window elapses; there is intentionally no flag
+  or code path to make *that* unbounded. If asked to remove or bypass the
+  automatic time-based stop, don't — surface the request instead, same
+  reasoning as the original refusal.
+  **Concurrency itself, unlike the time bound, is a separate and genuinely
+  optional cap** (`self.config.max_concurrency: Optional[int]`, `None`
+  meaning unbounded escalation): this was a deliberate follow-up decision
+  after the user was warned about the client-side resource-exhaustion
+  tradeoff (see README's "A note on limits") and explicitly chose unbounded
+  over a guessed default. `None` is the *default* when `--max-concurrency`
+  is omitted - it is not the same relaxation as the earlier rejected design,
+  since the time bound stays mandatory either way. Don't read "concurrency
+  is now unbounded by default" as license to also loosen the time bound —
+  they are unrelated knobs and only the time one was ever in question.
 - `normalize_url` deliberately does not use `urlparse().scheme` to detect
   whether a scheme is present — `urlparse("localhost:8080")` misreads
   `localhost` as the scheme, so the common homelab `host:port` case would

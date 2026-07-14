@@ -157,27 +157,34 @@ python stress_my_site.py takedown --url http://localhost:8080 -m 5
 | `--url` | Target URL, domain, or bare IP |
 | `-m`, `--minutes` | Minutes to hold the target down for once it breaks (required) |
 | `-c`, `--concurrency` | Ramp floor - starting concurrent connections (default: 10) |
-| `--max-concurrency` | Ramp ceiling. Defaults to `200 x -c` if omitted, same as `break` |
+| `--max-concurrency` | Optional escalation ceiling. **Unset by default** - escalation during the hold phase then has no cap other than this machine's own resources (see "A note on limits" below). Pass this if you want a hard ceiling instead |
 | `--timeout` | Per-request timeout in seconds (default: 10) |
 | `--method` | HTTP method (default: `GET`) |
 | `--insecure` | Disable TLS certificate verification |
 | `-y`, `--yes` | Skip the interactive authorization prompt |
 
-`takedown` first ramps exactly like `break`. The moment a breaking point is
-detected, concurrency is frozen at exactly that level (any workers still
-waiting to start as part of the ramp schedule are cancelled) - the run then
-holds there for `--minutes`, checking the target's health once a second
-against the trailing few seconds of buckets. Whenever the target is observed
-to have recovered, concurrency is escalated by 25% (always at least one more
-worker) to push past whatever just happened, capped at `--max-concurrency`.
-The run always ends automatically once `--minutes` elapses - Ctrl+C stops it
-early, same as any other mode.
+`takedown` first ramps exactly like `break` (using an internal 200x-`-c`
+target for that initial search, regardless of `--max-concurrency` - that's
+just how far the ramp searches for a breaking point, a separate concept from
+the hold phase below). The moment a breaking point is detected, concurrency
+is frozen at exactly that level (any workers still waiting to start as part
+of the ramp schedule are cancelled) - the run then holds there for
+`--minutes`, checking the target's health once a second against the trailing
+few seconds of buckets. Whenever the target is observed to have recovered,
+concurrency is escalated by 25% (always at least one more worker) to push
+past whatever just happened - clamped to `--max-concurrency` if you passed
+one, otherwise unbounded.
 
-There's no `--duration` and no unbounded option: **the whole point is a
-fixed, operator-chosen window** so you can run this against your own
-staging/homelab target and actively watch (in another terminal, dashboard,
-alert channel, etc.) whether your defenses respond in time - not to keep a
-target down indefinitely.
+**The time window is always bounded, the concurrency isn't (unless you ask
+it to be).** There's no `--duration` and no unbounded *time* option: the
+whole point is a fixed, operator-chosen window so you can run this against
+your own staging/homelab target and actively watch (in another terminal,
+dashboard, alert channel, etc.) whether your defenses respond in time - not
+to keep a target down indefinitely. Concurrency, on the other hand, defaults
+to escalating as far as it needs to rather than stopping at a guessed
+number - pass `--max-concurrency` explicitly if you want to cap that too
+(e.g. to protect your own machine's resources, or to simulate a specific
+attacker capacity).
 
 ## Detecting a stall
 
@@ -302,6 +309,14 @@ by connection errors rather than server 5xx responses, it prints a caveat
 to that effect — treat that as "the client ran out of resources," not "the
 target broke," and either lower `--max-concurrency` or spread the load
 across multiple machines.
+
+**`takedown` without `--max-concurrency` deliberately has no ceiling on
+this**, since the whole point is escalating as far as it takes to outpace a
+recovering defense. That means it's the one place in this tool where the
+above client-side limits aren't just a caveat to watch for - they're the
+*only* remaining cap once you drop `--max-concurrency`. If you'd rather
+have a hard ceiling than find out where your own machine's limit is,
+pass `--max-concurrency` explicitly.
 
 ## Tests
 
