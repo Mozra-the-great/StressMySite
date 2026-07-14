@@ -232,22 +232,25 @@ def next_concurrency(current: int, measured_rps: float, target_rps: float, ceili
     return min(candidate, ceiling)
 
 
-def escalate_concurrency(current: int, ceiling: int, factor: float = TAKEDOWN_ESCALATION_FACTOR) -> int:
+def escalate_concurrency(current: int, ceiling: Optional[int] = None, factor: float = TAKEDOWN_ESCALATION_FACTOR) -> int:
     """Compute the next worker count for `takedown` mode's hold phase.
 
     Called each time the target is observed to have recovered while held
     down: grows concurrency by `factor` (default +25%) to push past
     whatever recovery just happened, always advancing by at least one
     worker so a small `current` still makes forward progress. Clamped to
-    `ceiling` (--max-concurrency) - once there, further recoveries are
-    reported but can no longer be escalated against.
+    `ceiling` (--max-concurrency) if one was given - once there, further
+    recoveries are reported but can no longer be escalated against.
+    `ceiling=None` (the default: no --max-concurrency was given) means
+    unbounded - escalation is limited only by this machine's own resources,
+    not by a guessed number.
     """
     if current <= 0:
         raise ValueError("current must be positive")
-    if ceiling < current:
+    if ceiling is not None and ceiling < current:
         raise ValueError("ceiling must be >= current")
     candidate = max(math.ceil(current * factor), current + 1)
-    return min(candidate, ceiling)
+    return candidate if ceiling is None else min(candidate, ceiling)
 
 
 @dataclass
@@ -606,7 +609,11 @@ class RunConfig:
     mode: str  # "break", "requests", or "takedown"
     url: str
     concurrency: int  # ramp floor
-    max_concurrency: int  # ramp ceiling (always set - auto-defaulted if the user omits it)
+    # Ramp/escalation ceiling. Always set (auto-defaulted if omitted) for
+    # break/requests. For takedown it may be None - unbounded escalation,
+    # capped only by this machine's own resources rather than a guessed
+    # number, unless the user explicitly passes --max-concurrency.
+    max_concurrency: Optional[int]
     method: str = "GET"
     timeout: float = 10.0
     verify_tls: bool = True
@@ -758,7 +765,9 @@ class LoadGenerator:
         # The ramp starts at `concurrency` (the floor - the historical
         # meaning of `-c`) and climbs toward `max_concurrency`, which is
         # always set by this point (auto-defaulted in build_config_from_args
-        # if the user didn't pass one).
+        # if the user didn't pass one) - unlike takedown, break mode has no
+        # unbounded option.
+        assert self.config.max_concurrency is not None
         delays = ramp_delays_from_floor(self.config.concurrency, self.config.max_concurrency, self.config.ramp_up)
         reporter = asyncio.create_task(self._progress_reporter())
         workers = [asyncio.create_task(self._worker(session, delay)) for delay in delays]
@@ -789,6 +798,7 @@ class LoadGenerator:
         ceiling = self.config.max_concurrency
         target = self.config.target_rps
         assert target is not None  # enforced by build_config_from_args
+        assert ceiling is not None  # requests mode has no unbounded option, unlike takedown
 
         workers = [asyncio.create_task(self._worker(session, 0.0)) for _ in range(floor)]
         allowed = floor
@@ -883,10 +893,22 @@ class LoadGenerator:
         not-yet-started ramp workers so it doesn't keep climbing past it),
         then hold for `--minutes`, escalating concurrency (`escalate_concurrency`)
         each time the target is observed to have recovered. Always stops
-        automatically once the hold window elapses - there is no unbounded
-        mode here, only a user-chosen, fixed-length one.
+        automatically once the hold window elapses - the *time* bound is
+        always in force, but the *concurrency* ceiling
+        (`self.config.max_concurrency`) is optional: if the user didn't pass
+        --max-concurrency, escalation during the hold phase is unbounded,
+        limited only by this machine's own resources rather than a guessed
+        number. The initial ramp-to-breaking-point search still needs *some*
+        finite target to schedule delays against, so it falls back to
+        `default_break_max_concurrency` in that case - a separate concept
+        from the (possibly unbounded) hold-phase escalation ceiling.
         """
-        delays = ramp_delays_from_floor(self.config.concurrency, self.config.max_concurrency, self.config.ramp_up)
+        ramp_ceiling = (
+            self.config.max_concurrency
+            if self.config.max_concurrency is not None
+            else default_break_max_concurrency(self.config.concurrency)
+        )
+        delays = ramp_delays_from_floor(self.config.concurrency, ramp_ceiling, self.config.ramp_up)
         workers = [asyncio.create_task(self._worker(session, delay)) for delay in delays]
 
         ramp_deadline = self._start_time + TAKEDOWN_RAMP_SAFETY
@@ -903,7 +925,7 @@ class LoadGenerator:
         if breaking_point is None:
             print(
                 f"[takedown] target never broke within the {TAKEDOWN_RAMP_SAFETY:.0f}s ramp "
-                "safety window, even at the concurrency ceiling - stopping without a hold phase",
+                f"safety window, even at concurrency {ramp_ceiling} - stopping without a hold phase",
                 file=sys.stderr,
             )
             self.takedown_outcome = TakedownOutcome(
@@ -935,14 +957,16 @@ class LoadGenerator:
             file=sys.stderr,
         )
 
+        ceiling = self.config.max_concurrency  # None = unbounded escalation
         hold_deadline = time.monotonic() + self.config.takedown_minutes * 60.0
         escalations = 0
         while time.monotonic() < hold_deadline and not self._stop_event.is_set():
             await asyncio.sleep(1.0)
             recent = self.stats.buckets[-5:]
             recovered = find_breaking_point(recent, sustained_buckets=2) is None
-            if recovered and allowed < self.config.max_concurrency:
-                new_allowed = escalate_concurrency(allowed, self.config.max_concurrency)
+            at_ceiling = ceiling is not None and allowed >= ceiling
+            if recovered and not at_ceiling:
+                new_allowed = escalate_concurrency(allowed, ceiling)
                 if new_allowed > allowed:
                     for _ in range(new_allowed - allowed):
                         workers.append(asyncio.create_task(self._worker(session, 0.0)))
@@ -953,7 +977,7 @@ class LoadGenerator:
                     )
                     allowed = new_allowed
             status = "recovered" if recovered else "down"
-            if recovered and allowed >= self.config.max_concurrency:
+            if recovered and at_ceiling:
                 status += " (at concurrency ceiling - can't escalate further)"
             print(
                 f"[takedown:holding] t={time.monotonic() - self._start_time:5.1f}s  "
@@ -973,7 +997,12 @@ class LoadGenerator:
         return results
 
     async def run(self) -> None:
-        connector = aiohttp.TCPConnector(limit=self.config.max_concurrency, ssl=self.config.verify_tls)
+        # 0 is aiohttp's own convention for "no connector-level cap" - used
+        # when max_concurrency is None (takedown mode, no --max-concurrency
+        # given): escalation should be limited by this machine's actual
+        # resources, not throttled back down by a guessed connector limit.
+        connector_limit = self.config.max_concurrency if self.config.max_concurrency is not None else 0
+        connector = aiohttp.TCPConnector(limit=connector_limit, ssl=self.config.verify_tls)
         timeout = aiohttp.ClientTimeout(total=self.config.timeout)
 
         self._start_time = time.monotonic()
@@ -1220,10 +1249,16 @@ def _build_takedown_config(args: argparse.Namespace, url: str, concurrency: int)
 
     max_concurrency = args.max_concurrency
     if max_concurrency is None:
-        max_concurrency = default_break_max_concurrency(concurrency)
+        # Unlike break/requests, takedown has no default guess here: the
+        # whole point of escalating against recovery is to go as high as
+        # the target actually needs, not stop at an arbitrary number picked
+        # in advance. The only cap left is this machine's own resources
+        # (ephemeral ports, sockets, memory) - see README's "A note on
+        # limits". Pass --max-concurrency explicitly to keep a hard ceiling.
         print(
-            f"[takedown] --max-concurrency defaulted to {max_concurrency} "
-            f"({max_concurrency // concurrency}x -c) - override with --max-concurrency if you want a different ceiling",
+            "[takedown] no --max-concurrency set - concurrency will escalate without a "
+            "cap during the hold phase, limited only by this machine's own resources. "
+            "Pass --max-concurrency to set an explicit ceiling instead.",
             file=sys.stderr,
         )
     elif max_concurrency < concurrency:

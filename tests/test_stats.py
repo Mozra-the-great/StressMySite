@@ -378,6 +378,14 @@ class TestEscalateConcurrency:
         with pytest.raises(ValueError):
             escalate_concurrency(100, ceiling=50)
 
+    def test_no_ceiling_grows_unbounded(self):
+        # default (no --max-concurrency given): no clamp at all
+        assert escalate_concurrency(1000) == 1250
+        assert escalate_concurrency(1_000_000) == 1_250_000
+
+    def test_no_ceiling_still_advances_by_at_least_one(self):
+        assert escalate_concurrency(2) == 3
+
 
 class TestBuildConfigValidation:
     def test_zero_concurrency_raises(self):
@@ -526,10 +534,13 @@ class TestBuildConfigValidation:
             with pytest.raises(ValueError, match="--minutes must be a positive"):
                 build_config_from_args(args)
 
-        def test_max_concurrency_defaults_to_200x_concurrency(self):
+        def test_max_concurrency_defaults_to_unbounded(self):
+            # unlike break/requests, takedown has no default guess - the
+            # whole point of escalating against recovery is to go as high
+            # as needed, not stop at an arbitrary pre-picked number
             args = parse_args(["takedown", "--url", "https://example.com", "-c", "10", "-m", "5", "-y"])
             config = build_config_from_args(args)
-            assert config.max_concurrency == 2000
+            assert config.max_concurrency is None
 
         def test_explicit_max_concurrency_used(self):
             args = parse_args(["takedown", "--url", "https://example.com", "-c", "10", "-m", "5", "--max-concurrency", "500", "-y"])
