@@ -41,11 +41,16 @@ jobs:
           # run (the previous config ran "successfully" but posted nothing).
           prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
           allowed_bots: 'claude[bot]'
-          # Without an explicit allowlist, any Bash call (e.g. git/gh to
-          # inspect the diff) has no way to get interactively approved in a
-          # non-interactive CI run and is auto-denied - the previous config's
-          # silent permission_denials_count:1 failure on every PR in this repo.
-          claude_args: '--allowedTools Bash,Read,Grep,Glob'
-          show_full_output: true # temporary - diagnosing the remaining permission_denials_count:1
+          # Without an explicit allowlist, any tool call has no way to get
+          # interactively approved in a non-interactive CI run and is
+          # auto-denied. Skill is required first - the prompt's very first
+          # action is invoking the code-review:code-review skill itself, and
+          # without it listed here that call was denied immediately, causing
+          # the agent to improvise a partial review via ad hoc subagents
+          # instead (and never finish, hence zero comments posted despite
+          # completing "successfully"). Bash/Read/Grep/Glob are what the
+          # skill needs once it's actually running to inspect the diff.
+          claude_args: '--allowedTools Skill,Bash,Read,Grep,Glob'
+          show_full_output: true # temporary - confirming the Skill-tool fix actually works end to end
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
