@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write # required to post the review comment - read-only caused every run to fail with a permission denial
       issues: read
       id-token: write
 
@@ -37,6 +37,10 @@ jobs:
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
           allowed_bots: 'claude[bot]'
-          show_full_output: true
+          # Without an explicit allowlist, any Bash call (e.g. git/gh to
+          # inspect the diff) has no way to get interactively approved in a
+          # non-interactive CI run and is auto-denied - the previous config's
+          # silent permission_denials_count:1 failure on every PR in this repo.
+          claude_args: '--allowedTools Bash,Read,Grep,Glob'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
