@@ -35,12 +35,17 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          # --comment is required to actually post findings as inline PR
+          # comments - without it, the skill only returns findings as plain
+          # text output, which is never surfaced anywhere in a headless CI
+          # run (the previous config ran "successfully" but posted nothing).
+          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
           allowed_bots: 'claude[bot]'
           # Without an explicit allowlist, any Bash call (e.g. git/gh to
           # inspect the diff) has no way to get interactively approved in a
           # non-interactive CI run and is auto-denied - the previous config's
           # silent permission_denials_count:1 failure on every PR in this repo.
           claude_args: '--allowedTools Bash,Read,Grep,Glob'
+          show_full_output: true # temporary - diagnosing the remaining permission_denials_count:1
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
