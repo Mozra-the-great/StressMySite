@@ -20,6 +20,11 @@ or scripted (`--yes`) — is your explicit confirmation that you have that
 authorization. Use it against your own servers, staging environments, or
 targets you have written permission to test.
 
+`takedown` mode specifically holds a target down on purpose, for a
+fixed, operator-chosen window, so you can watch your own defenses react - it
+is not, and must never be used as, an unbounded denial-of-service tool. It
+always stops automatically once `--minutes` elapses.
+
 ## Install
 
 Requires Python 3.9+ and Chrome/Chromium is **not** needed (there's no browser
@@ -29,11 +34,12 @@ involved).
 pip install -r requirements.txt
 ```
 
-## Two modes
+## Three modes
 
 ```sh
 python stress_my_site.py break    --url <target> [options]
 python stress_my_site.py requests --url <target> --target-rps N [options]
+python stress_my_site.py takedown --url <target> --minutes N [options]
 python stress_my_site.py                          # interactive: prompts for everything
 ```
 
@@ -47,13 +53,24 @@ threshold. Use this when the question is "where does this fall over?"
 sustained rather than a one-second blip. Use this when the question is "can
 this handle N requests/second?"
 
-Both modes ramp from a floor (`-c`/`--concurrency`) toward a ceiling
-(`--max-concurrency`), but they ramp differently: `break` follows a
-pre-computed, time-based schedule (concurrency grows on a fixed clock,
-independent of what's actually happening). `requests` is feedback-driven —
-it looks at each closed second's *measured* req/s and only grows concurrency
-while that's under target, freezing the moment it's reached (or the ceiling
-is hit).
+**`takedown`** ramps past the breaking point, then holds the target down for
+a fixed number of minutes - escalating concurrency whenever it recovers - so
+you can watch your own defenses (rate limiting, autoscaling, alerting) react
+in real time while it runs, then get a summary of how they held up. Use this
+when the question is "if this got hit hard right now, would my defenses catch
+it?" It always stops automatically once `--minutes` elapses (or immediately
+on Ctrl+C) - there is no unbounded mode.
+
+All three modes ramp from a floor (`-c`/`--concurrency`) toward a ceiling
+(`--max-concurrency`), but `break`/`takedown` and `requests` ramp
+differently: `break` and `takedown`'s initial ramp follow a pre-computed,
+time-based schedule (concurrency grows on a fixed clock, independent of what's
+actually happening). `requests` is feedback-driven — it looks at each closed
+second's *measured* req/s and only grows concurrency while that's under
+target, freezing the moment it's reached (or the ceiling is hit). `takedown`
+switches to a feedback-driven escalation once it breaks: concurrency freezes
+at the level that broke the target, then only grows again when the target is
+observed to have recovered.
 
 ## Usage
 
@@ -63,11 +80,11 @@ is hit).
 python stress_my_site.py
 ```
 
-You'll be prompted for the target URL, mode (`break`/`requests`), the
-concurrency floor, the mode's headline value (nothing further for `break`;
-`--target-rps` for `requests`), and an authorization confirmation. Anything
-not prompted for (timeouts, ceilings, etc.) uses the same defaults as the
-command-line form below.
+You'll be prompted for the target URL, mode (`break`/`requests`/`takedown`),
+the concurrency floor, the mode's headline value (nothing further for
+`break`; `--target-rps` for `requests`; `--minutes` for `takedown`), and an
+authorization confirmation. Anything not prompted for (timeouts, ceilings,
+etc.) uses the same defaults as the command-line form below.
 
 ### `break` mode
 
@@ -127,9 +144,44 @@ measured rate degrades during the hold (errors, latency spike, or a stall -
 see below), the run reports that the rate was **not sustained** and shows
 the breaking point within the hold window.
 
+### `takedown` mode
+
+```sh
+# Break it, then hold it down for 5 minutes so you can watch your
+# alerting/autoscaling react in real time
+python stress_my_site.py takedown --url http://localhost:8080 -m 5
+```
+
+| Flag | Description |
+|---|---|
+| `--url` | Target URL, domain, or bare IP |
+| `-m`, `--minutes` | Minutes to hold the target down for once it breaks (required) |
+| `-c`, `--concurrency` | Ramp floor - starting concurrent connections (default: 10) |
+| `--max-concurrency` | Ramp ceiling. Defaults to `200 x -c` if omitted, same as `break` |
+| `--timeout` | Per-request timeout in seconds (default: 10) |
+| `--method` | HTTP method (default: `GET`) |
+| `--insecure` | Disable TLS certificate verification |
+| `-y`, `--yes` | Skip the interactive authorization prompt |
+
+`takedown` first ramps exactly like `break`. The moment a breaking point is
+detected, concurrency is frozen at exactly that level (any workers still
+waiting to start as part of the ramp schedule are cancelled) - the run then
+holds there for `--minutes`, checking the target's health once a second
+against the trailing few seconds of buckets. Whenever the target is observed
+to have recovered, concurrency is escalated by 25% (always at least one more
+worker) to push past whatever just happened, capped at `--max-concurrency`.
+The run always ends automatically once `--minutes` elapses - Ctrl+C stops it
+early, same as any other mode.
+
+There's no `--duration` and no unbounded option: **the whole point is a
+fixed, operator-chosen window** so you can run this against your own
+staging/homelab target and actively watch (in another terminal, dashboard,
+alert channel, etc.) whether your defenses respond in time - not to keep a
+target down indefinitely.
+
 ## Detecting a stall
 
-Both modes report a **breaking point**: the first sustained window (2+
+All three modes report a **breaking point**: the first sustained window (2+
 consecutive one-second buckets) where either the hard-failure rate (timeouts,
 5xx responses, and connection errors — 4xx responses are deliberately
 excluded, since an endpoint that legitimately rejects requests with e.g. 404
@@ -211,6 +263,25 @@ Reached:           ~512.3 req/s at concurrency 14
 Sustained for the full 30s hold window.
 
 No breaking point detected - target held up under the applied load.
+============================================================
+```
+
+### `takedown`
+
+```
+============================================================
+Target:            http://localhost:8080
+Duration:          312.40s
+Total requests:    1284031
+...
+
+Broke at concurrency ~68, held down for 5.0 minute(s).
+Recoveries observed (each triggered an escalation): 4
+Final concurrency:  166
+
+BREAKING POINT DETECTED:
+  Server started failing around t=12s, active load ~68.
+  Reason: failure rate 12.0% exceeded 5% threshold
 ============================================================
 ```
 

@@ -17,6 +17,7 @@ from stress_my_site import (  # noqa: E402
     DEFAULT_BREAK_DURATION,
     REQUESTS_MODE_HOLD_SECONDS,
     REQUESTS_MODE_RAMP_SAFETY,
+    TAKEDOWN_RAMP_SAFETY,
     Bucket,
     RunStats,
     TokenBucketLimiter,
@@ -24,6 +25,7 @@ from stress_my_site import (  # noqa: E402
     build_report,
     default_break_max_concurrency,
     default_requests_max_concurrency,
+    escalate_concurrency,
     find_breaking_point,
     next_concurrency,
     normalize_url,
@@ -354,6 +356,29 @@ class TestDefaultMaxConcurrency:
         assert default_requests_max_concurrency(500, target_rps=1) == 500
 
 
+class TestEscalateConcurrency:
+    def test_grows_by_default_factor(self):
+        assert escalate_concurrency(100, ceiling=1000) == 125  # +25%
+
+    def test_always_advances_by_at_least_one(self):
+        # small current where the factor alone would round down to no growth
+        assert escalate_concurrency(2, ceiling=1000) == 3
+
+    def test_custom_factor_respected(self):
+        assert escalate_concurrency(100, ceiling=1000, factor=2.0) == 200
+
+    def test_clamped_at_ceiling(self):
+        assert escalate_concurrency(900, ceiling=1000, factor=2.0) == 1000
+
+    def test_non_positive_current_raises(self):
+        with pytest.raises(ValueError):
+            escalate_concurrency(0, ceiling=1000)
+
+    def test_ceiling_below_current_raises(self):
+        with pytest.raises(ValueError):
+            escalate_concurrency(100, ceiling=50)
+
+
 class TestBuildConfigValidation:
     def test_zero_concurrency_raises(self):
         args = parse_args(["break", "--url", "https://example.com", "-c", "0", "-y"])
@@ -476,6 +501,56 @@ class TestBuildConfigValidation:
             config = build_config_from_args(args)
             assert config.duration == pytest.approx(REQUESTS_MODE_RAMP_SAFETY + REQUESTS_MODE_HOLD_SECONDS + 30.0)
 
+    class TestTakedownMode:
+        def test_minutes_required_non_interactively(self):
+            args = parse_args(["takedown", "--url", "https://example.com", "-c", "10", "-y"])
+            # no --minutes given and no stdin to prompt from in this test -
+            # see the analogous requests-mode test for why both exception
+            # types are accepted here
+            with pytest.raises((EOFError, OSError)):
+                build_config_from_args(args)
+
+        def test_minutes_stored(self):
+            args = parse_args(["takedown", "--url", "https://example.com", "-c", "10", "-m", "5", "-y"])
+            config = build_config_from_args(args)
+            assert config.mode == "takedown"
+            assert config.takedown_minutes == 5
+
+        def test_zero_minutes_raises(self):
+            args = parse_args(["takedown", "--url", "https://example.com", "-c", "10", "-m", "0", "-y"])
+            with pytest.raises(ValueError, match="--minutes must be a positive"):
+                build_config_from_args(args)
+
+        def test_negative_minutes_raises(self):
+            args = parse_args(["takedown", "--url", "https://example.com", "-c", "10", "-m", "-1", "-y"])
+            with pytest.raises(ValueError, match="--minutes must be a positive"):
+                build_config_from_args(args)
+
+        def test_max_concurrency_defaults_to_200x_concurrency(self):
+            args = parse_args(["takedown", "--url", "https://example.com", "-c", "10", "-m", "5", "-y"])
+            config = build_config_from_args(args)
+            assert config.max_concurrency == 2000
+
+        def test_explicit_max_concurrency_used(self):
+            args = parse_args(["takedown", "--url", "https://example.com", "-c", "10", "-m", "5", "--max-concurrency", "500", "-y"])
+            config = build_config_from_args(args)
+            assert config.max_concurrency == 500
+
+        def test_max_concurrency_below_concurrency_raises(self):
+            args = parse_args(["takedown", "--url", "https://example.com", "-c", "500", "-m", "5", "--max-concurrency", "100", "-y"])
+            with pytest.raises(ValueError, match="must be greater than or equal to"):
+                build_config_from_args(args)
+
+        def test_duration_is_internal_safety_cap_derived_from_minutes(self):
+            args = parse_args(["takedown", "--url", "https://example.com", "-c", "10", "-m", "5", "-y"])
+            config = build_config_from_args(args)
+            assert config.duration == pytest.approx(TAKEDOWN_RAMP_SAFETY + 5 * 60.0 + 30.0)
+
+        def test_ramp_up_is_90_percent_of_ramp_safety(self):
+            args = parse_args(["takedown", "--url", "https://example.com", "-c", "10", "-m", "5", "-y"])
+            config = build_config_from_args(args)
+            assert config.ramp_up == pytest.approx(TAKEDOWN_RAMP_SAFETY * 0.9)
+
 
 class TestBuildReport:
     def test_report_contains_key_sections(self):
@@ -507,3 +582,34 @@ class TestBuildReport:
         report = build_report(stats, bp)
         assert "BREAKING POINT DETECTED" in report
         assert "42" in report
+
+    def test_report_shows_takedown_outcome(self):
+        from stress_my_site import TakedownOutcome
+
+        stats = RunStats(url="https://example.com")
+        stats.total_requests = 10
+        stats.duration = 5.0
+        outcome = TakedownOutcome(
+            hold_minutes=5.0,
+            breaking_point_found=True,
+            concurrency_at_break=42,
+            escalations=3,
+            final_concurrency=90,
+        )
+
+        report = build_report(stats, None, takedown_outcome=outcome)
+        assert "held down for 5.0 minute" in report
+        assert "Recoveries observed" in report
+        assert "3" in report
+        assert "90" in report
+
+    def test_report_shows_takedown_never_broke(self):
+        from stress_my_site import TakedownOutcome
+
+        stats = RunStats(url="https://example.com")
+        stats.total_requests = 10
+        stats.duration = 5.0
+        outcome = TakedownOutcome(hold_minutes=5.0, breaking_point_found=False)
+
+        report = build_report(stats, None, takedown_outcome=outcome)
+        assert "never broke" in report

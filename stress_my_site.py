@@ -11,11 +11,16 @@ browser-tab simulator: requests are fired directly over HTTP with asyncio +
 aiohttp, so throughput is bounded by your machine's CPU/network, not by how
 many browser tabs Chrome can render.
 
-Two modes:
+Three modes:
     break     Ramp concurrency up until the target starts failing, and
               report the breaking point.
     requests  Ramp concurrency up until measured throughput reaches
               --target-rps, then hold to confirm it's actually sustained.
+    takedown  Ramp past the breaking point, then hold the target down for a
+              fixed number of minutes - escalating concurrency whenever it
+              recovers - so you can test your own defenses (rate limiting,
+              autoscaling, alerting) in real time while it runs. Always
+              stops automatically after --minutes; Ctrl+C stops it early.
 
 Usage examples:
     # Find the breaking point, starting at 50 and ramping toward an
@@ -30,6 +35,10 @@ Usage examples:
     # confirm it's sustained:
     python stress_my_site.py requests --url http://localhost:8080 \
         --target-rps 500
+
+    # Break it, then hold it down for 5 minutes (escalating if it recovers)
+    # so you can watch your alerting/autoscaling respond in real time:
+    python stress_my_site.py takedown --url http://localhost:8080 -m 5
 
     python stress_my_site.py            # interactive prompts for everything
 
@@ -70,6 +79,14 @@ REQUESTS_MODE_RAMP_SAFETY = 120.0
 # headroom on top in `default_requests_max_concurrency` - this is a starting
 # guess, not a promise, and is always overridable with --max-concurrency.
 ASSUMED_RPS_PER_WORKER = 50.0
+# takedown mode: outer safety cap on the initial ramp-to-breaking-point
+# phase, in case the target never breaks even at the concurrency ceiling
+# (internal - not user-facing, mirrors requests mode's own ramp safety cap).
+TAKEDOWN_RAMP_SAFETY = 120.0
+# takedown mode: concurrency growth factor applied each time the target is
+# observed to have recovered during the hold window (+25% per escalation,
+# always at least +1 worker - see `escalate_concurrency`).
+TAKEDOWN_ESCALATION_FACTOR = 1.25
 
 try:
     import aiohttp
@@ -215,6 +232,24 @@ def next_concurrency(current: int, measured_rps: float, target_rps: float, ceili
     return min(candidate, ceiling)
 
 
+def escalate_concurrency(current: int, ceiling: int, factor: float = TAKEDOWN_ESCALATION_FACTOR) -> int:
+    """Compute the next worker count for `takedown` mode's hold phase.
+
+    Called each time the target is observed to have recovered while held
+    down: grows concurrency by `factor` (default +25%) to push past
+    whatever recovery just happened, always advancing by at least one
+    worker so a small `current` still makes forward progress. Clamped to
+    `ceiling` (--max-concurrency) - once there, further recoveries are
+    reported but can no longer be escalated against.
+    """
+    if current <= 0:
+        raise ValueError("current must be positive")
+    if ceiling < current:
+        raise ValueError("ceiling must be >= current")
+    candidate = max(math.ceil(current * factor), current + 1)
+    return min(candidate, ceiling)
+
+
 @dataclass
 class Bucket:
     """Aggregated stats for one time window (default: 1 second) of the run.
@@ -277,6 +312,19 @@ class RequestsModeOutcome:
     concurrency_at_target: Optional[int] = None
     measured_rps_at_target: Optional[float] = None
     sustained: Optional[bool] = None  # None means the target was never reached, so holding never started
+
+
+@dataclass
+class TakedownOutcome:
+    """Result of a `takedown` mode run: did the target break during the
+    ramp, and how did it behave while held down for the configured window?
+    """
+
+    hold_minutes: float
+    breaking_point_found: bool
+    concurrency_at_break: Optional[int] = None
+    escalations: int = 0  # number of times the target recovered and concurrency was pushed higher
+    final_concurrency: Optional[int] = None
 
 
 def find_breaking_point(
@@ -397,6 +445,7 @@ def build_report(
     stats: RunStats,
     breaking_point: Optional[BreakingPoint],
     requests_outcome: Optional[RequestsModeOutcome] = None,
+    takedown_outcome: Optional[TakedownOutcome] = None,
 ) -> str:
     """Format the final human-readable report from raw run statistics."""
     lines: list[str] = []
@@ -472,6 +521,21 @@ def build_report(
                     f"{REQUESTS_MODE_HOLD_SECONDS:.0f}s hold window (see breaking point below)."
                 )
 
+    if takedown_outcome is not None:
+        lines.append("")
+        if not takedown_outcome.breaking_point_found:
+            lines.append(
+                "Target never broke, even at the concurrency ceiling - held up under "
+                "the full ramp, no hold window was run."
+            )
+        else:
+            lines.append(
+                f"Broke at concurrency ~{takedown_outcome.concurrency_at_break}, "
+                f"held down for {takedown_outcome.hold_minutes:.1f} minute(s)."
+            )
+            lines.append(f"Recoveries observed (each triggered an escalation): {takedown_outcome.escalations}")
+            lines.append(f"Final concurrency:  {takedown_outcome.final_concurrency}")
+
     lines.append("")
     if breaking_point is not None:
         lines.append("BREAKING POINT DETECTED:")
@@ -539,17 +603,18 @@ class TokenBucketLimiter:
 
 @dataclass
 class RunConfig:
-    mode: str  # "break" or "requests"
+    mode: str  # "break", "requests", or "takedown"
     url: str
     concurrency: int  # ramp floor
     max_concurrency: int  # ramp ceiling (always set - auto-defaulted if the user omits it)
     method: str = "GET"
     timeout: float = 10.0
     verify_tls: bool = True
-    duration: float = DEFAULT_BREAK_DURATION  # break: user-facing safety cap; requests: internal safety cap
-    ramp_up: float = 0.0  # break mode only, internally computed - not user-facing
+    duration: float = DEFAULT_BREAK_DURATION  # break: user-facing safety cap; requests/takedown: internal safety cap
+    ramp_up: float = 0.0  # break/takedown modes only, internally computed - not user-facing
     rps: Optional[float] = None  # break mode only: optional global rate limit
     target_rps: Optional[float] = None  # requests mode only
+    takedown_minutes: Optional[float] = None  # takedown mode only: how long to hold the target down once it breaks
 
 
 class LoadGenerator:
@@ -562,6 +627,7 @@ class LoadGenerator:
         self._rate_limiter = TokenBucketLimiter(config.rps) if config.rps else None
         self._active_workers = 0
         self.requests_outcome: Optional[RequestsModeOutcome] = None
+        self.takedown_outcome: Optional[TakedownOutcome] = None
 
     @property
     def start_time(self) -> float:
@@ -811,6 +877,101 @@ class LoadGenerator:
         results = await asyncio.gather(*workers, return_exceptions=True)
         return results
 
+    async def _run_takedown(self, session: "aiohttp.ClientSession") -> list:
+        """takedown mode's driver: ramp like `break` until a breaking point
+        is found, freeze concurrency at exactly that level (cancelling any
+        not-yet-started ramp workers so it doesn't keep climbing past it),
+        then hold for `--minutes`, escalating concurrency (`escalate_concurrency`)
+        each time the target is observed to have recovered. Always stops
+        automatically once the hold window elapses - there is no unbounded
+        mode here, only a user-chosen, fixed-length one.
+        """
+        delays = ramp_delays_from_floor(self.config.concurrency, self.config.max_concurrency, self.config.ramp_up)
+        workers = [asyncio.create_task(self._worker(session, delay)) for delay in delays]
+
+        ramp_deadline = self._start_time + TAKEDOWN_RAMP_SAFETY
+        breaking_point: Optional[BreakingPoint] = None
+        while breaking_point is None and time.monotonic() < ramp_deadline:
+            await asyncio.sleep(1.0)
+            breaking_point = find_breaking_point(self.stats.buckets)
+            print(
+                f"[takedown:ramping] t={time.monotonic() - self._start_time:5.1f}s  "
+                f"requests={self.stats.total_requests}  active={self._active_workers}",
+                file=sys.stderr,
+            )
+
+        if breaking_point is None:
+            print(
+                f"[takedown] target never broke within the {TAKEDOWN_RAMP_SAFETY:.0f}s ramp "
+                "safety window, even at the concurrency ceiling - stopping without a hold phase",
+                file=sys.stderr,
+            )
+            self.takedown_outcome = TakedownOutcome(
+                hold_minutes=self.config.takedown_minutes,
+                breaking_point_found=False,
+            )
+            self._stop_event.set()
+            results = await asyncio.gather(*workers, return_exceptions=True)
+            return results
+
+        # Freeze concurrency at exactly what's active right now: cancel any
+        # workers still waiting on their staggered ramp-up delay so the hold
+        # phase starts from the level that broke the target, not wherever
+        # the ramp schedule would otherwise have kept climbing to.
+        break_elapsed = time.monotonic() - self._start_time
+        held_workers = []
+        for worker, delay in zip(workers, delays):
+            if delay > break_elapsed:
+                worker.cancel()
+            else:
+                held_workers.append(worker)
+        workers = held_workers
+        allowed = self._active_workers
+        concurrency_at_break = allowed
+        print(
+            f"[takedown] breaking point reached at t={breaking_point.bucket_index}s "
+            f"(active load ~{allowed}) - holding for {self.config.takedown_minutes:.1f} minute(s), "
+            "escalating whenever the target recovers",
+            file=sys.stderr,
+        )
+
+        hold_deadline = time.monotonic() + self.config.takedown_minutes * 60.0
+        escalations = 0
+        while time.monotonic() < hold_deadline and not self._stop_event.is_set():
+            await asyncio.sleep(1.0)
+            recent = self.stats.buckets[-5:]
+            recovered = find_breaking_point(recent, sustained_buckets=2) is None
+            if recovered and allowed < self.config.max_concurrency:
+                new_allowed = escalate_concurrency(allowed, self.config.max_concurrency)
+                if new_allowed > allowed:
+                    for _ in range(new_allowed - allowed):
+                        workers.append(asyncio.create_task(self._worker(session, 0.0)))
+                    escalations += 1
+                    print(
+                        f"[takedown] target recovered - escalating concurrency {allowed} -> {new_allowed}",
+                        file=sys.stderr,
+                    )
+                    allowed = new_allowed
+            status = "recovered" if recovered else "down"
+            if recovered and allowed >= self.config.max_concurrency:
+                status += " (at concurrency ceiling - can't escalate further)"
+            print(
+                f"[takedown:holding] t={time.monotonic() - self._start_time:5.1f}s  "
+                f"status={status}  concurrency={allowed}",
+                file=sys.stderr,
+            )
+
+        self.takedown_outcome = TakedownOutcome(
+            hold_minutes=self.config.takedown_minutes,
+            breaking_point_found=True,
+            concurrency_at_break=concurrency_at_break,
+            escalations=escalations,
+            final_concurrency=allowed,
+        )
+        self._stop_event.set()
+        results = await asyncio.gather(*workers, return_exceptions=True)
+        return results
+
     async def run(self) -> None:
         connector = aiohttp.TCPConnector(limit=self.config.max_concurrency, ssl=self.config.verify_tls)
         timeout = aiohttp.ClientTimeout(total=self.config.timeout)
@@ -823,8 +984,10 @@ class LoadGenerator:
             try:
                 if self.config.mode == "break":
                     results = await self._run_break(session)
-                else:
+                elif self.config.mode == "requests":
                     results = await self._run_requests(session)
+                else:
+                    results = await self._run_takedown(session)
             finally:
                 self._stop_event.set()
                 heartbeat.cancel()
@@ -847,12 +1010,20 @@ def _prompt(question: str, default: Optional[str] = None) -> str:
     return answer if answer else (default or "")
 
 
-def _confirm_authorization() -> None:
+def _confirm_authorization(mode: str) -> None:
     print(
         "\nThis tool generates real concurrent load and can degrade or take down\n"
         "a target server. Only use it against systems you own or are explicitly\n"
         "authorized to test.\n"
     )
+    if mode == "takedown":
+        print(
+            "takedown mode deliberately keeps the target down for the configured\n"
+            "--minutes window, escalating load whenever it recovers. It stops\n"
+            "automatically after that window (or immediately on Ctrl+C), but for\n"
+            "that entire window the target will be unavailable to everyone, not\n"
+            "just you.\n"
+        )
     answer = input("Do you own or have authorization to test this target? [y/N]: ").strip().lower()
     if answer not in ("y", "yes"):
         print("Aborting: authorization not confirmed.", file=sys.stderr)
@@ -862,19 +1033,23 @@ def _confirm_authorization() -> None:
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Async HTTP load/stress tester. Two modes: 'break' ramps concurrency "
+            "Async HTTP load/stress tester. Three modes: 'break' ramps concurrency "
             "up until your target starts failing and reports the breaking point; "
             "'requests' ramps up until measured throughput reaches --target-rps, "
-            "then holds to confirm it's sustained."
+            "then holds to confirm it's sustained; 'takedown' ramps past the "
+            "breaking point and holds the target down for a fixed number of "
+            "minutes, escalating whenever it recovers, so you can test your own "
+            "defenses in real time."
         )
     )
     parser.add_argument("-y", "--yes", action="store_true", help="Skip the interactive authorization confirmation")
     # Ensures these attributes always exist on the parsed namespace even when
     # no subcommand is given (fully interactive invocation), since they're
-    # otherwise only defined on the `break`/`requests` subparsers below.
+    # otherwise only defined on the `break`/`requests`/`takedown` subparsers below.
     parser.set_defaults(
         url=None, concurrency=None, max_concurrency=None, timeout=10.0,
         method="GET", insecure=False, duration=None, rps=None, target_rps=None,
+        minutes=None,
     )
 
     common = argparse.ArgumentParser(add_help=False)
@@ -904,6 +1079,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     requests_parser.add_argument("--target-rps", type=float, default=None, help="Target requests/second to ramp toward and hold")
 
+    takedown_parser = subparsers.add_parser(
+        "takedown", parents=[common],
+        help=(
+            "Ramp concurrency past the breaking point, then hold the target down for "
+            "a fixed number of minutes - escalating whenever it recovers - so you can "
+            "test your own defenses (rate limiting, autoscaling, alerting) in real time."
+        ),
+    )
+    takedown_parser.add_argument(
+        "-m", "--minutes", type=float, default=None,
+        help="Minutes to hold the target down for once it breaks (required)",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -913,10 +1101,20 @@ def build_config_from_args(args: argparse.Namespace) -> RunConfig:
 
     mode = args.mode
     if mode is None:
-        mode_answer = _prompt("Mode - 'break' to find the breaking point, 'requests' to ramp to a target rate", "break")
-        mode = "requests" if mode_answer.strip().lower().startswith("r") else "break"
-    if mode not in ("break", "requests"):
-        raise ValueError(f"Unknown mode '{mode}' - expected 'break' or 'requests'")
+        mode_answer = _prompt(
+            "Mode - 'break' to find the breaking point, 'requests' to ramp to a "
+            "target rate, 'takedown' to hold the target down for a fixed window",
+            "break",
+        )
+        mode_answer = mode_answer.strip().lower()
+        if mode_answer.startswith("r"):
+            mode = "requests"
+        elif mode_answer.startswith("t"):
+            mode = "takedown"
+        else:
+            mode = "break"
+    if mode not in ("break", "requests", "takedown"):
+        raise ValueError(f"Unknown mode '{mode}' - expected 'break', 'requests', or 'takedown'")
 
     concurrency = (
         args.concurrency
@@ -931,7 +1129,9 @@ def build_config_from_args(args: argparse.Namespace) -> RunConfig:
 
     if mode == "break":
         return _build_break_config(args, url, concurrency)
-    return _build_requests_config(args, url, concurrency)
+    if mode == "requests":
+        return _build_requests_config(args, url, concurrency)
+    return _build_takedown_config(args, url, concurrency)
 
 
 def _build_break_config(args: argparse.Namespace, url: str, concurrency: int) -> RunConfig:
@@ -1011,6 +1211,45 @@ def _build_requests_config(args: argparse.Namespace, url: str, concurrency: int)
     )
 
 
+def _build_takedown_config(args: argparse.Namespace, url: str, concurrency: int) -> RunConfig:
+    minutes = args.minutes
+    if minutes is None:
+        minutes = float(_prompt("Minutes to hold the target down for once it breaks", "5"))
+    if minutes <= 0:
+        raise ValueError("--minutes must be a positive number")
+
+    max_concurrency = args.max_concurrency
+    if max_concurrency is None:
+        max_concurrency = default_break_max_concurrency(concurrency)
+        print(
+            f"[takedown] --max-concurrency defaulted to {max_concurrency} "
+            f"({max_concurrency // concurrency}x -c) - override with --max-concurrency if you want a different ceiling",
+            file=sys.stderr,
+        )
+    elif max_concurrency < concurrency:
+        raise ValueError(
+            f"--max-concurrency ({max_concurrency}) must be greater than or equal to "
+            f"-c/--concurrency ({concurrency}) - it's the ceiling the ramp climbs toward."
+        )
+
+    # Ramp across ~90% of the internal ramp-safety window, same spirit as
+    # break mode's ramp_up default.
+    ramp_up = TAKEDOWN_RAMP_SAFETY * 0.9
+
+    return RunConfig(
+        mode="takedown",
+        url=url,
+        concurrency=concurrency,
+        max_concurrency=max_concurrency,
+        method=args.method,
+        timeout=args.timeout,
+        verify_tls=not args.insecure,
+        duration=TAKEDOWN_RAMP_SAFETY + minutes * 60.0 + 30.0,
+        ramp_up=ramp_up,
+        takedown_minutes=minutes,
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     try:
@@ -1024,7 +1263,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if not args.yes:
         try:
-            _confirm_authorization()
+            _confirm_authorization(config.mode)
         except EOFError:
             print("Error: no input available to confirm authorization; pass --yes to skip this prompt.", file=sys.stderr)
             return 1
@@ -1044,7 +1283,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     breaking_point = find_breaking_point(generator.stats.buckets)
     print()
-    print(build_report(generator.stats, breaking_point, generator.requests_outcome))
+    print(build_report(generator.stats, breaking_point, generator.requests_outcome, generator.takedown_outcome))
     return 130 if interrupted else 0
 
 
