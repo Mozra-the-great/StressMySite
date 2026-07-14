@@ -22,16 +22,22 @@ pip install -r requirements.txt
 python stress_my_site.py                                          # interactive prompts
 python stress_my_site.py break --url https://example.com -c 50
 python stress_my_site.py requests --url http://localhost:8080 --target-rps 500
+python stress_my_site.py takedown --url http://localhost:8080 -m 5
 python -m pytest tests/ -v                                         # run unit tests
 ```
 
 ## Notes
-- **Two subcommands, not a flat flag surface.** `break` ramps concurrency up
+- **Three subcommands, not a flat flag surface.** `break` ramps concurrency up
   until the target starts failing and reports the breaking point.
   `requests` ramps concurrency up until *measured* throughput reaches
   `--target-rps`, then holds for a fixed 30s (`REQUESTS_MODE_HOLD_SECONDS`)
-  to confirm it's actually sustained rather than a one-second blip. There is
-  no flat/count mode (`-n`) or top-level `--rps` cap/`--stop-on-break`/
+  to confirm it's actually sustained rather than a one-second blip. `takedown`
+  ramps past the breaking point, then holds the target down for a fixed,
+  user-chosen `--minutes`, escalating concurrency whenever it recovers, so the
+  operator can watch their own defenses react - it always stops automatically
+  after `--minutes` (never unbounded; see the dedicated `takedown` note
+  below for why that boundary is load-bearing, not incidental). There is no
+  flat/count mode (`-n`) or top-level `--rps` cap/`--stop-on-break`/
   `--ramp-up` anymore — those were dropped in the mode-based rewrite; see
   `README.md` for the full flag tables per mode. `--rps` (a global rate
   limiter, `TokenBucketLimiter`) still exists, but only on `break` — it
@@ -75,10 +81,10 @@ python -m pytest tests/ -v                                         # run unit te
   just the hold window's buckets to produce the sustained/not-sustained
   verdict.
 - **`-c`/`--concurrency` is the ramp floor, `--max-concurrency` is the
-  ceiling** in both modes - always set (auto-defaulted if the user omits it):
-  `default_break_max_concurrency` (200x `-c`) for `break`,
+  ceiling** in all three modes - always set (auto-defaulted if the user omits
+  it): `default_break_max_concurrency` (200x `-c`) for `break` and `takedown`,
   `default_requests_max_concurrency` (a rough `--target-rps`-derived estimate,
-  assuming ~50 req/s/worker with 3x headroom) for `requests`. Both defaults
+  assuming ~50 req/s/worker with 3x headroom) for `requests`. All defaults
   are printed at run start along with the assumption behind them, and are
   always overridable.
 - **Very high `--max-concurrency` can make the *client* look like the
@@ -95,6 +101,23 @@ python -m pytest tests/ -v                                         # run unit te
   flag for this anymore, since finding that point *is* the mode's purpose.
   `-d`/`--duration` (default 300s) is just the outer safety cap in case the
   target never breaks.
+- **`takedown` mode (`LoadGenerator._run_takedown`) exists specifically as a
+  *bounded* alternative to an earlier, rejected unbounded design.** The
+  original ask was "keep the server down indefinitely, escalate whenever it
+  recovers, stop only manually" — that's a recovery-defeating denial-of-service
+  primitive with no measurement or stop condition, not a load test, and was
+  refused as such (see project history/PR discussion). What's implemented
+  instead: ramp like `break` until a breaking point, freeze concurrency at
+  exactly that level (cancelling any not-yet-started ramp workers via
+  `worker.cancel()` so it doesn't keep climbing past the break), then hold for
+  a **mandatory, user-supplied `--minutes`**, escalating via
+  `escalate_concurrency` (+25%/step, always advances by >=1, clamped to
+  `--max-concurrency`) each time `find_breaking_point` on the trailing 5
+  buckets returns `None` (i.e. no sustained badness recently = "recovered").
+  It always stops automatically once the hold window elapses; there is
+  intentionally no flag or code path to make the hold unbounded. If asked to
+  remove or bypass that automatic stop, don't — surface the request instead,
+  same reasoning as the original refusal.
 - `normalize_url` deliberately does not use `urlparse().scheme` to detect
   whether a scheme is present — `urlparse("localhost:8080")` misreads
   `localhost` as the scheme, so the common homelab `host:port` case would
