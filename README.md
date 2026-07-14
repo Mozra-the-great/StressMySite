@@ -29,6 +29,32 @@ involved).
 pip install -r requirements.txt
 ```
 
+## Two modes
+
+```sh
+python stress_my_site.py break    --url <target> [options]
+python stress_my_site.py requests --url <target> --target-rps N [options]
+python stress_my_site.py                          # interactive: prompts for everything
+```
+
+**`break`** ramps concurrency up until your target starts failing, and reports
+the breaking point: the first sustained window where the failure rate, p95
+latency, or throughput itself (see "Detecting a stall" below) crosses a
+threshold. Use this when the question is "where does this fall over?"
+
+**`requests`** ramps concurrency up until *measured* throughput reaches
+`--target-rps`, then holds there for 30s to confirm the rate is actually
+sustained rather than a one-second blip. Use this when the question is "can
+this handle N requests/second?"
+
+Both modes ramp from a floor (`-c`/`--concurrency`) toward a ceiling
+(`--max-concurrency`), but they ramp differently: `break` follows a
+pre-computed, time-based schedule (concurrency grows on a fixed clock,
+independent of what's actually happening). `requests` is feedback-driven —
+it looks at each closed second's *measured* req/s and only grows concurrency
+while that's under target, freezing the moment it's reached (or the ceiling
+is hit).
+
 ## Usage
 
 ### Interactive
@@ -37,74 +63,89 @@ pip install -r requirements.txt
 python stress_my_site.py
 ```
 
-You'll be prompted for the target URL, concurrency, load mode (fixed request
-count vs. time-based duration), and an authorization confirmation.
+You'll be prompted for the target URL, mode (`break`/`requests`), the
+concurrency floor, the mode's headline value (nothing further for `break`;
+`--target-rps` for `requests`), and an authorization confirmation. Anything
+not prompted for (timeouts, ceilings, etc.) uses the same defaults as the
+command-line form below.
 
-### Command-line
+### `break` mode
 
 ```sh
-# 5,000 requests total, 50 concurrent connections
-python stress_my_site.py --url https://example.com -c 50 -n 5000
+# Ramp from 50 upward (default ceiling: 200x -c = 10,000) for up to 300s
+# (the default safety cap), stopping as soon as it breaks
+python stress_my_site.py break --url https://example.com -c 50
 
-# Sustain load for 30 seconds with a 20-second ramp-up (0 -> 100 connections)
-python stress_my_site.py --url http://localhost:8080 -c 100 -d 30 --ramp-up 20
-
-# Keep climbing from 100 up to 20,000 concurrent connections across the whole
-# 5-minute run, stopping as soon as a breaking point is detected
-python stress_my_site.py --url http://localhost:8080 -c 100 -d 300 \
-    --max-concurrency 20000 --stop-on-break
+# Explicit ceiling and a tighter safety cap
+python stress_my_site.py break --url http://localhost:8080 \
+    -c 100 --max-concurrency 20000 -d 120
 ```
 
 | Flag | Description |
 |---|---|
 | `--url` | Target URL, domain, or bare IP (scheme defaults to `https://`) |
-| `-c`, `--concurrency` | Number of concurrent connections (the ramp's starting point if `--max-concurrency` is set) |
-| `-n`, `--requests` | Total number of requests to send (count mode) |
-| `-d`, `--duration` | Duration in seconds to sustain load (duration mode) — mutually exclusive with `-n` |
-| `--ramp-up` | Seconds to linearly ramp concurrency up (default: 0 = instant full load; defaults to ~90% of `--duration` if `--max-concurrency` is given). Only supported in duration mode (`-d`) — see below |
-| `--max-concurrency` | Ceiling to continuously ramp concurrency up to over the run, instead of plateauing at `-c` once the ramp finishes. Requires `-d`/`--duration`. Use this to push toward tens of thousands of req/s |
-| `--stop-on-break` | End the run as soon as a breaking point is detected, instead of always running the full `-d`/`-n` |
+| `-c`, `--concurrency` | Ramp floor - starting concurrent connections (default: 10) |
+| `--max-concurrency` | Ramp ceiling. Defaults to `200 x -c` if omitted - a generous ceiling since finding it *is* the point |
+| `-d`, `--duration` | Outer safety cap in seconds, in case the target never breaks (default: 300) |
+| `--rps` | Optional global rate limit (requests/second) across all workers |
 | `--timeout` | Per-request timeout in seconds (default: 10) |
 | `--method` | HTTP method (default: `GET`) |
 | `--insecure` | Disable TLS certificate verification (e.g. self-signed certs on a homelab target) |
-| `--rps` | Optional global rate limit (requests/second) across all workers |
-| `-y`, `--yes` | Skip the interactive authorization prompt (for scripted runs against already-cleared targets) |
+| `-y`, `--yes` | Skip the interactive authorization prompt |
 
-You must specify either `-n`/`--requests` (count mode) or `-d`/`--duration`
-(duration mode) — not both. If neither is given on the command line, you'll be
-prompted to choose interactively.
+The ramp climbs across ~90% of `--duration`, leaving a tail at full
+concurrency so the top of the climb gets a chance to send something before
+the run ends. The run always stops the moment a breaking point is detected -
+there's no reason to keep hammering an already-broken target for the rest of
+`--duration`.
 
-## Ramp-up and the breaking point
+### `requests` mode
 
-Starting at full concurrency instantly tells you whether the target survives
-*that* load level — it doesn't tell you the boundary. With `--ramp-up`,
-concurrency increases linearly over the given number of seconds, and the tool
-buckets results per second, correlating error rate / timeouts / p95 latency
-with the concurrency active at that moment.
+```sh
+# Ramp up until throughput reaches 500 req/s, then hold for 30s
+python stress_my_site.py requests --url http://localhost:8080 --target-rps 500
 
-`--ramp-up` only works with `-d`/`--duration`, not `-n`/`--requests`: in count
-mode all workers share one request budget, and workers that start immediately
-drain it before staggered workers ever wake up, so the ramp never actually
-happens. Combining `--ramp-up` with `-n` is rejected with an explanation.
-`--ramp-up` must also be less than `--duration` — otherwise workers are still
-staggering in when the run ends and the ramp never reaches full concurrency.
+# Cap how high the ramp is allowed to climb while chasing the target
+python stress_my_site.py requests --url http://localhost:8080 \
+    --target-rps 5000 --max-concurrency 300
+```
 
-By default the ramp climbs from `-c` up to `-c` (i.e. no further scaling once
-it plateaus) — that ceiling is exactly `-c`, no more. To keep climbing for the
-*whole* run instead of flattening out early, add `--max-concurrency`: the ramp
-then targets that value instead, defaulting `--ramp-up` to ~90% of
-`--duration` so it's still climbing right up to near the end. This is the way
-to reach req/s in the thousands or tens of thousands, since `-c` alone is a
-hard ceiling regardless of `--ramp-up`. Pair it with `--stop-on-break` so the
-run ends automatically once the target starts failing, instead of continuing
-to hammer an already-broken server for the rest of `--duration`.
+| Flag | Description |
+|---|---|
+| `--url` | Target URL, domain, or bare IP |
+| `--target-rps` | Target requests/second to ramp toward and hold (required) |
+| `-c`, `--concurrency` | Ramp floor - starting concurrent connections (default: 10) |
+| `--max-concurrency` | Ramp ceiling. Defaults to a rough estimate from `--target-rps` (assumes ~50 req/s per worker, x3 headroom) - override this if your target is slower or faster than that assumption |
+| `--timeout` | Per-request timeout in seconds (default: 10) |
+| `--method` | HTTP method (default: `GET`) |
+| `--insecure` | Disable TLS certificate verification |
+| `-y`, `--yes` | Skip the interactive authorization prompt |
 
-After the run, it reports whether it found a **breaking point**: the first
-sustained window (2+ consecutive one-second buckets) where either the
-hard-failure rate (timeouts, 5xx responses, and connection errors — 4xx
-responses are deliberately excluded, since an endpoint that legitimately
-rejects requests with e.g. 404 isn't "failing under load") exceeds 5%, or p95
-latency exceeds 3x the baseline. If found, you get something like:
+There's no `--duration` here: the run length is however long it takes to
+reach the target (or give up at the ceiling), plus a fixed 30s hold. If the
+measured rate degrades during the hold (errors, latency spike, or a stall -
+see below), the run reports that the rate was **not sustained** and shows
+the breaking point within the hold window.
+
+## Detecting a stall
+
+Both modes report a **breaking point**: the first sustained window (2+
+consecutive one-second buckets) where either the hard-failure rate (timeouts,
+5xx responses, and connection errors — 4xx responses are deliberately
+excluded, since an endpoint that legitimately rejects requests with e.g. 404
+isn't "failing under load") exceeds 5%, p95 latency exceeds 3x the baseline,
+**or the target has gone quiet** — zero requests completing in a second while
+workers were known to be active, for longer than `max(2x baseline latency,
+1s)`.
+
+That last condition matters at low concurrency specifically: if only ~10
+workers are in flight and the target chokes, it's entirely possible for
+*every* worker to stall simultaneously, producing whole seconds with zero
+completions. The gap is measured against the baseline latency (not "any
+empty second") so a target with multi-second response times doesn't
+false-positive just for being slow-but-healthy.
+
+If found, you get something like:
 
 ```
 BREAKING POINT DETECTED:
@@ -114,14 +155,12 @@ BREAKING POINT DETECTED:
 ```
 
 If the target held up under the full applied load, you'll see "No breaking
-point detected" instead — try a higher `-c`/`-n`/`-d` to push further.
+point detected" instead — try a higher `-c`/`--max-concurrency` to push
+further.
 
-**Recommendation:** start with a modest concurrency and a `--ramp-up`, rather
-than jumping straight to a very high `-c`. It's easier to read a gradual climb
-to failure than to walk in with a sledgehammer and only learn "it fell over
-immediately."
+## Example reports
 
-## Example report
+### `break`
 
 ```
 ============================================================
@@ -158,15 +197,32 @@ BREAKING POINT DETECTED:
 ============================================================
 ```
 
+### `requests`
+
+```
+============================================================
+Target:            http://localhost:8080
+Duration:          38.00s
+Total requests:    17820
+...
+
+Target rate:       500.0 req/s
+Reached:           ~512.3 req/s at concurrency 14
+Sustained for the full 30s hold window.
+
+No breaking point detected - target held up under the applied load.
+============================================================
+```
+
 ## A note on limits
 
-There's still a practical ceiling: very high concurrency or `--rps` values can
-saturate *this machine's* CPU/network before the target actually buckles. If
-throughput plateaus while your own CPU sits near 100%, that's the client, not
-the server, being the bottleneck — reduce `-c` and/or spread the load across
-multiple machines rather than trusting the numbers as-is.
+There's still a practical ceiling: very high concurrency can saturate *this
+machine's* CPU/network before the target actually buckles. If throughput
+plateaus while your own CPU sits near 100%, that's the client, not the
+server, being the bottleneck — reduce `-c`/`--max-concurrency` and/or spread
+the load across multiple machines rather than trusting the numbers as-is.
 
-This matters even more with `--max-concurrency` pushed into the thousands:
+This matters even more once `--max-concurrency` climbs into the thousands:
 on Windows, the default ephemeral port range is ~16,000 ports, plus a
 TIME_WAIT hold-open period after each connection closes — so tens of
 thousands of concurrent connections can exhaust the *client's* own ports
@@ -184,8 +240,9 @@ python -m pytest tests/ -v
 ```
 
 Tests cover the pure helper functions (URL normalization, percentile math,
-ramp-up scheduling, breaking-point detection, report formatting) — no network
-or asyncio event loop involved.
+ramp-up scheduling, the adaptive concurrency controller, breaking-point
+detection, CLI argument validation, report formatting) — no network or
+asyncio event loop involved.
 
 ## License
 

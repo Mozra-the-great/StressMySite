@@ -14,12 +14,18 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from stress_my_site import (  # noqa: E402
+    DEFAULT_BREAK_DURATION,
+    REQUESTS_MODE_HOLD_SECONDS,
+    REQUESTS_MODE_RAMP_SAFETY,
     Bucket,
     RunStats,
     TokenBucketLimiter,
     build_config_from_args,
     build_report,
+    default_break_max_concurrency,
+    default_requests_max_concurrency,
     find_breaking_point,
+    next_concurrency,
     normalize_url,
     parse_args,
     percentile,
@@ -240,6 +246,17 @@ class TestFindBreakingPoint:
 
         assert find_breaking_point(buckets, sustained_buckets=2) is None
 
+    def test_no_baseline_yet_does_not_flag_stall(self):
+        # Cold start: workers active, nothing has completed yet - a slow-
+        # but-healthy target mid-first-request (e.g. multi-second latency)
+        # is indistinguishable from a stall until a baseline p95 exists, so
+        # this must NOT fire. Without a `baseline_p95 > 0` guard, the stall
+        # threshold collapses to its 1.0s floor and fires within 2-3s
+        # against any target slower than that - a real regression this
+        # test would have caught (see stress_my_site.py history).
+        buckets = [Bucket(index=i, requests=0, active_load=10) for i in range(3)]
+        assert find_breaking_point(buckets, sustained_buckets=2) is None
+
     def test_stall_after_first_empty_second_not_yet_flagged(self):
         # A single empty second alone (gap=1) must not trigger even at a
         # near-zero baseline latency - the 1-second bucket granularity means
@@ -288,98 +305,176 @@ class TestTokenBucketLimiter:
         assert remaining <= limiter.capacity
 
 
+class TestNextConcurrency:
+    def test_frozen_when_already_at_target(self):
+        # caller is expected to stop calling once measured >= target, but
+        # the function itself should still make forward progress if asked
+        assert next_concurrency(10, measured_rps=100, target_rps=100, ceiling=1000) > 10
+
+    def test_no_signal_yet_doubles(self):
+        assert next_concurrency(10, measured_rps=0, target_rps=500, ceiling=1000) == 20
+
+    def test_proportional_growth_under_target(self):
+        # measured 50 at concurrency 10, target 100 -> roughly double
+        assert next_concurrency(10, measured_rps=50, target_rps=100, ceiling=1000) == 20
+
+    def test_growth_capped_at_2x_per_step(self):
+        # measured 10 at concurrency 10, target 1000 -> ratio is huge but
+        # capped at 2x so a single noisy sample can't cause a huge overshoot
+        assert next_concurrency(10, measured_rps=10, target_rps=1000, ceiling=10_000) == 20
+
+    def test_always_advances_by_at_least_one(self):
+        # measured already very close to target - ratio near 1 must not
+        # round down to zero growth
+        assert next_concurrency(10, measured_rps=99, target_rps=100, ceiling=1000) == 11
+
+    def test_clamped_at_ceiling(self):
+        assert next_concurrency(950, measured_rps=10, target_rps=1000, ceiling=1000) == 1000
+
+    def test_non_positive_current_raises(self):
+        with pytest.raises(ValueError):
+            next_concurrency(0, measured_rps=10, target_rps=100, ceiling=1000)
+
+    def test_ceiling_below_current_raises(self):
+        with pytest.raises(ValueError):
+            next_concurrency(100, measured_rps=10, target_rps=1000, ceiling=50)
+
+
+class TestDefaultMaxConcurrency:
+    def test_break_default_is_200x_floor(self):
+        assert default_break_max_concurrency(10) == 2000
+        assert default_break_max_concurrency(50) == 10_000
+
+    def test_requests_default_scales_with_target(self):
+        low = default_requests_max_concurrency(10, target_rps=50)
+        high = default_requests_max_concurrency(10, target_rps=5000)
+        assert high > low
+
+    def test_requests_default_never_below_floor(self):
+        assert default_requests_max_concurrency(500, target_rps=1) == 500
+
+
 class TestBuildConfigValidation:
-    def test_ramp_up_with_requests_raises(self):
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-n", "100", "--ramp-up", "10", "-y"])
-        with pytest.raises(ValueError, match="only supported together with --duration"):
-            build_config_from_args(args)
-
-    def test_ramp_up_with_duration_is_allowed(self):
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-d", "10", "--ramp-up", "5", "-y"])
-        config = build_config_from_args(args)
-        assert config.ramp_up == 5
-
     def test_zero_concurrency_raises(self):
-        args = parse_args(["--url", "https://example.com", "-c", "0", "-n", "100", "-y"])
+        args = parse_args(["break", "--url", "https://example.com", "-c", "0", "-y"])
         with pytest.raises(ValueError, match="positive integer"):
             build_config_from_args(args)
 
-    def test_negative_rps_raises(self):
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-n", "100", "--rps", "-1", "-y"])
-        with pytest.raises(ValueError, match="--rps must be a positive number"):
-            build_config_from_args(args)
-
-    def test_both_modes_raises(self):
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-n", "100", "-d", "10", "-y"])
-        with pytest.raises(ValueError, match="not both"):
-            build_config_from_args(args)
-
     def test_zero_timeout_raises(self):
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-n", "100", "--timeout", "0", "-y"])
+        args = parse_args(["break", "--url", "https://example.com", "-c", "5", "--timeout", "0", "-y"])
         with pytest.raises(ValueError, match="--timeout must be a positive"):
             build_config_from_args(args)
 
     def test_host_port_url_normalized_end_to_end(self):
-        args = parse_args(["--url", "localhost:8080", "-c", "5", "-n", "100", "-y"])
+        args = parse_args(["break", "--url", "localhost:8080", "-c", "5", "-y"])
         config = build_config_from_args(args)
         assert config.url == "https://localhost:8080"
 
-    def test_explicit_ramp_up_at_or_past_duration_raises(self):
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-d", "10", "--ramp-up", "10", "-y"])
-        with pytest.raises(ValueError, match="must be less than --duration"):
-            build_config_from_args(args)
+    def test_unknown_mode_raises(self):
+        with pytest.raises(SystemExit):
+            parse_args(["bogus-mode", "--url", "https://example.com", "-y"])
 
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-d", "10", "--ramp-up", "15", "-y"])
-        with pytest.raises(ValueError, match="must be less than --duration"):
-            build_config_from_args(args)
+    class TestBreakMode:
+        def test_max_concurrency_defaults_to_200x_concurrency(self):
+            args = parse_args(["break", "--url", "https://example.com", "-c", "10", "-y"])
+            config = build_config_from_args(args)
+            assert config.mode == "break"
+            assert config.max_concurrency == 2000
 
-    def test_explicit_ramp_up_just_below_duration_is_allowed(self):
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-d", "10", "--ramp-up", "9.9", "-y"])
-        config = build_config_from_args(args)
-        assert config.ramp_up == 9.9
+        def test_explicit_max_concurrency_used(self):
+            args = parse_args(["break", "--url", "https://example.com", "-c", "10", "--max-concurrency", "500", "-y"])
+            config = build_config_from_args(args)
+            assert config.max_concurrency == 500
 
-    def test_max_concurrency_with_requests_raises(self):
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-n", "100", "--max-concurrency", "500", "-y"])
-        with pytest.raises(ValueError, match="only supported together with --duration"):
-            build_config_from_args(args)
+        def test_max_concurrency_below_concurrency_raises(self):
+            args = parse_args(["break", "--url", "https://example.com", "-c", "500", "--max-concurrency", "100", "-y"])
+            with pytest.raises(ValueError, match="must be greater than or equal to"):
+                build_config_from_args(args)
 
-    def test_max_concurrency_not_greater_than_concurrency_raises(self):
-        args = parse_args(["--url", "https://example.com", "-c", "500", "-d", "10", "--max-concurrency", "500", "-y"])
-        with pytest.raises(ValueError, match="must be greater than"):
-            build_config_from_args(args)
+        def test_max_concurrency_equal_to_concurrency_is_allowed(self):
+            # a flat, no-ramp run at a fixed concurrency is a legitimate
+            # way to use break mode - just watch for a breaking point at a
+            # single load level instead of climbing
+            args = parse_args(["break", "--url", "https://example.com", "-c", "500", "--max-concurrency", "500", "-y"])
+            config = build_config_from_args(args)
+            assert config.max_concurrency == 500
 
-        args = parse_args(["--url", "https://example.com", "-c", "500", "-d", "10", "--max-concurrency", "100", "-y"])
-        with pytest.raises(ValueError, match="must be greater than"):
-            build_config_from_args(args)
+        def test_duration_defaults_to_module_constant(self):
+            args = parse_args(["break", "--url", "https://example.com", "-c", "10", "-y"])
+            config = build_config_from_args(args)
+            assert config.duration == DEFAULT_BREAK_DURATION
 
-    def test_max_concurrency_defaults_ramp_up_across_most_of_duration(self):
-        args = parse_args(["--url", "https://example.com", "-c", "10", "-d", "100", "--max-concurrency", "5000", "-y"])
-        config = build_config_from_args(args)
-        assert config.max_concurrency == 5000
-        assert config.ramp_up == pytest.approx(90.0)
+        def test_explicit_duration_respected(self):
+            args = parse_args(["break", "--url", "https://example.com", "-c", "10", "-d", "60", "-y"])
+            config = build_config_from_args(args)
+            assert config.duration == 60.0
 
-    def test_max_concurrency_with_explicit_ramp_up_is_respected(self):
-        args = parse_args([
-            "--url", "https://example.com", "-c", "10", "-d", "100",
-            "--max-concurrency", "5000", "--ramp-up", "50", "-y",
-        ])
-        config = build_config_from_args(args)
-        assert config.ramp_up == 50.0
+        def test_zero_duration_raises(self):
+            args = parse_args(["break", "--url", "https://example.com", "-c", "10", "-d", "0", "-y"])
+            with pytest.raises(ValueError, match="--duration must be a positive"):
+                build_config_from_args(args)
 
-    def test_max_concurrency_with_zero_ramp_up_raises(self):
-        args = parse_args([
-            "--url", "https://example.com", "-c", "10", "-d", "100",
-            "--max-concurrency", "5000", "--ramp-up", "0", "-y",
-        ])
-        with pytest.raises(ValueError, match="needs a positive --ramp-up"):
-            build_config_from_args(args)
+        def test_ramp_up_is_90_percent_of_duration(self):
+            args = parse_args(["break", "--url", "https://example.com", "-c", "10", "-d", "100", "-y"])
+            config = build_config_from_args(args)
+            assert config.ramp_up == pytest.approx(90.0)
 
-    def test_stop_on_break_flag_defaults_false_and_can_be_enabled(self):
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-n", "100", "-y"])
-        assert build_config_from_args(args).stop_on_break is False
+        def test_negative_rps_raises(self):
+            args = parse_args(["break", "--url", "https://example.com", "-c", "5", "--rps", "-1", "-y"])
+            with pytest.raises(ValueError, match="--rps must be a positive number"):
+                build_config_from_args(args)
 
-        args = parse_args(["--url", "https://example.com", "-c", "5", "-n", "100", "--stop-on-break", "-y"])
-        assert build_config_from_args(args).stop_on_break is True
+        def test_rps_is_optional_and_stored(self):
+            args = parse_args(["break", "--url", "https://example.com", "-c", "5", "--rps", "200", "-y"])
+            config = build_config_from_args(args)
+            assert config.rps == 200
+
+    class TestRequestsMode:
+        def test_target_rps_required_non_interactively(self):
+            args = parse_args(["requests", "--url", "https://example.com", "-c", "10", "-y"])
+            # no --target-rps given, so it falls back to an interactive
+            # prompt; under pytest's captured stdin that raises OSError
+            # (a real non-interactive shell would see EOFError instead -
+            # main() handles both the same way)
+            with pytest.raises((EOFError, OSError)):
+                build_config_from_args(args)
+
+        def test_target_rps_stored(self):
+            args = parse_args(["requests", "--url", "https://example.com", "-c", "10", "--target-rps", "500", "-y"])
+            config = build_config_from_args(args)
+            assert config.mode == "requests"
+            assert config.target_rps == 500
+
+        def test_zero_target_rps_raises(self):
+            args = parse_args(["requests", "--url", "https://example.com", "-c", "10", "--target-rps", "0", "-y"])
+            with pytest.raises(ValueError, match="--target-rps must be a positive"):
+                build_config_from_args(args)
+
+        def test_max_concurrency_defaults_from_target_rps(self):
+            args = parse_args(["requests", "--url", "https://example.com", "-c", "10", "--target-rps", "500", "-y"])
+            config = build_config_from_args(args)
+            assert config.max_concurrency == default_requests_max_concurrency(10, 500)
+
+        def test_explicit_max_concurrency_used(self):
+            args = parse_args([
+                "requests", "--url", "https://example.com", "-c", "10",
+                "--target-rps", "500", "--max-concurrency", "50", "-y",
+            ])
+            config = build_config_from_args(args)
+            assert config.max_concurrency == 50
+
+        def test_max_concurrency_below_concurrency_raises(self):
+            args = parse_args([
+                "requests", "--url", "https://example.com", "-c", "100",
+                "--target-rps", "500", "--max-concurrency", "10", "-y",
+            ])
+            with pytest.raises(ValueError, match="must be greater than or equal to"):
+                build_config_from_args(args)
+
+        def test_duration_is_internal_safety_cap_not_exposed(self):
+            args = parse_args(["requests", "--url", "https://example.com", "-c", "10", "--target-rps", "500", "-y"])
+            config = build_config_from_args(args)
+            assert config.duration == pytest.approx(REQUESTS_MODE_RAMP_SAFETY + REQUESTS_MODE_HOLD_SECONDS + 30.0)
 
 
 class TestBuildReport:
