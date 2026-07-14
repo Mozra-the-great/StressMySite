@@ -188,6 +188,7 @@ def find_breaking_point(
     err_threshold: float = 0.05,
     latency_factor: float = 3.0,
     sustained_buckets: int = 2,
+    stall_factor: float = 2.0,
 ) -> Optional[BreakingPoint]:
     """Find the first sustained window where the target starts failing.
 
@@ -197,35 +198,65 @@ def find_breaking_point(
         deliberately excluded, see `Bucket.hard_failure_rate`) exceeds
         `err_threshold`, OR
       - the p95 latency exceeds `latency_factor` times the baseline p95
-        (the p95 of the first bucket that has data).
+        (the p95 of the first bucket that has data), OR
+      - the target has gone quiet: zero requests *completed* in a second
+        where workers were known to be active (`active_load > 0`), for
+        longer than `max(baseline_p95 * stall_factor, 1.0)` seconds. That
+        floor matters — a target with a 3s baseline latency can legitimately
+        produce a couple of empty one-second buckets between completions
+        while still being healthy, so a bare "any empty second" rule would
+        false-positive on slow-but-fine targets. Gauging the gap against the
+        baseline latency instead only flags a *real* stall: workers in
+        flight noticeably longer than they normally take.
+
+    A completely stalled window (all workers wedged, nothing completing)
+    used to be invisible to this function entirely: buckets with zero
+    completions were dropped before any of the checks above ran, so a full
+    stall could never accumulate `sustained_buckets` in a row. Buckets are
+    now kept as long as workers were active during them (`active_load > 0`),
+    so the stall itself becomes the detected failure.
 
     Returns None if no such sustained degradation is found.
     """
-    data_buckets = [b for b in buckets if b.requests > 0]
+    data_buckets = [b for b in buckets if b.requests > 0 or b.active_load > 0]
     if not data_buckets:
         return None
 
-    baseline_p95 = data_buckets[0].p95_latency or 0.0
+    baseline_p95 = next((b.p95_latency for b in data_buckets if b.p95_latency is not None), None) or 0.0
+    stall_threshold = max(baseline_p95 * stall_factor, 1.0)
 
-    def is_bad(b: Bucket) -> tuple[bool, str]:
+    def is_bad(b: Bucket, gap_seconds: int) -> tuple[bool, str]:
+        if b.requests == 0:
+            if gap_seconds > stall_threshold:
+                return True, (
+                    f"no requests completed for {gap_seconds}s while "
+                    f"{b.active_load} workers were active (stalled)"
+                )
+            return False, ""
         if b.hard_failure_rate > err_threshold:
             return True, f"failure rate {b.hard_failure_rate:.1%} exceeded {err_threshold:.0%} threshold"
         if baseline_p95 > 0 and b.p95_latency is not None and b.p95_latency > baseline_p95 * latency_factor:
             return True, f"p95 latency {b.p95_latency:.3f}s exceeded {latency_factor}x baseline ({baseline_p95:.3f}s)"
         return False, ""
 
+    # Evaluated up front (rather than re-derived from the bucket alone once a
+    # sustained run is found) because `is_bad` for a zero-request bucket
+    # depends on `gap_seconds`, which is state accumulated while scanning
+    # forward, not something recoverable from a single bucket in isolation.
+    evaluations: list[tuple[bool, str]] = []
+    gap_seconds = 0
+    for b in data_buckets:
+        gap_seconds = 0 if b.requests > 0 else gap_seconds + 1
+        evaluations.append(is_bad(b, gap_seconds))
+
     consecutive = 0
-    for position, b in enumerate(data_buckets):
-        bad, _ = is_bad(b)
+    for position, (bad, _reason) in enumerate(evaluations):
         if bad:
             consecutive += 1
             if consecutive >= sustained_buckets:
-                # report the first bucket of the sustained run, using *its*
-                # own reason (not the current bucket's) so the reported
-                # metrics and the stated reason stay consistent
                 first_bad_position = max(position - sustained_buckets + 1, 0)
                 first_bad = data_buckets[first_bad_position]
-                _, first_reason = is_bad(first_bad)
+                _, first_reason = evaluations[first_bad_position]
                 return BreakingPoint(
                     bucket_index=first_bad.index,
                     active_load=first_bad.active_load,
@@ -293,13 +324,14 @@ def build_report(stats: RunStats, breaking_point: Optional[BreakingPoint]) -> st
         lines.append("")
         lines.append("Per-second breakdown (time / active load / req/s / success rate / p95):")
         for b in stats.buckets:
-            if b.requests == 0:
+            if b.requests == 0 and b.active_load == 0:
                 continue
-            success_rate = b.successes / b.requests
+            success_rate = b.successes / b.requests if b.requests else 0.0
             p95 = f"{b.p95_latency:.3f}s" if b.p95_latency is not None else "n/a"
+            success_display = f"{success_rate:>6.1%}" if b.requests else "  stall"
             lines.append(
                 f"  t={b.index:>4}s  load={b.active_load:>5}  "
-                f"req/s={b.requests:>6}  success={success_rate:>6.1%}  p95={p95}"
+                f"req/s={b.requests:>6}  success={success_display}  p95={p95}"
             )
 
     lines.append("")
@@ -467,6 +499,23 @@ class LoadGenerator:
         finally:
             self._active_workers -= 1
 
+    async def _heartbeat(self) -> None:
+        """Record `active_load` into the current bucket once a second.
+
+        `_worker` only touches a bucket's `active_load` when it *starts* a
+        request. If every worker is wedged mid-request for a whole second
+        (the exact moment a real stall is happening), no worker calls
+        `_bucket_for` and that second's `active_load` would otherwise stay
+        at the dataclass default of 0 — indistinguishable from "no load was
+        applied yet". This task guarantees every second gets a true
+        `active_load` sample regardless of whether anything completed.
+        """
+        while not self._stop_event.is_set():
+            await asyncio.sleep(1.0)
+            elapsed = time.monotonic() - self._start_time
+            bucket = self._bucket_for(elapsed)
+            bucket.active_load = max(bucket.active_load, self._active_workers)
+
     async def _progress_reporter(self) -> None:
         last_count = 0
         while not self._stop_event.is_set():
@@ -512,6 +561,7 @@ class LoadGenerator:
 
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             reporter = asyncio.create_task(self._progress_reporter())
+            heartbeat = asyncio.create_task(self._heartbeat())
             workers = [
                 asyncio.create_task(self._worker(session, delay)) for delay in delays
             ]
@@ -523,7 +573,8 @@ class LoadGenerator:
             finally:
                 self._stop_event.set()
                 reporter.cancel()
-                await asyncio.gather(reporter, return_exceptions=True)
+                heartbeat.cancel()
+                await asyncio.gather(reporter, heartbeat, return_exceptions=True)
 
         self.stats.duration = time.monotonic() - self._start_time
 

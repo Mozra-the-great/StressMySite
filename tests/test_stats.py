@@ -202,6 +202,53 @@ class TestFindBreakingPoint:
         buckets = [Bucket(index=0, requests=0)]
         assert find_breaking_point(buckets) is None
 
+    def test_total_stall_detected_at_low_concurrency(self):
+        # Regression test for the original bug report: with a small worker
+        # count (e.g. ~10), a real slowdown can stall *every* worker at
+        # once, producing whole seconds with zero completions. Those used
+        # to be dropped from `data_buckets` entirely, so a full stall could
+        # never accumulate `sustained_buckets` in a row and was invisible.
+        buckets = []
+        for i in range(3):  # healthy baseline, fast responses
+            b = Bucket(index=i, requests=100, successes=100, active_load=10)
+            b.latencies = [0.02] * 100
+            buckets.append(b)
+        for i in range(3, 6):  # every worker wedged - nothing completes
+            buckets.append(Bucket(index=i, requests=0, active_load=10))
+
+        result = find_breaking_point(buckets, sustained_buckets=2)
+        assert result is not None
+        assert "stalled" in result.reason
+
+    def test_slow_but_healthy_target_not_flagged_as_stalled(self):
+        # A target with several-second latency legitimately produces empty
+        # one-second buckets between completions while working fine. The
+        # stall check must be judged against the baseline latency, not
+        # "any empty second", or this would false-positive.
+        buckets = []
+        # baseline established at ~3.5s latency
+        b0 = Bucket(index=0, requests=1, successes=1, active_load=1)
+        b0.latencies = [3.5]
+        buckets.append(b0)
+        for i in range(1, 3):  # gap while the next request is still in flight
+            buckets.append(Bucket(index=i, requests=0, active_load=1))
+        b3 = Bucket(index=3, requests=1, successes=1, active_load=1)
+        b3.latencies = [3.5]
+        buckets.append(b3)
+        for i in range(4, 6):
+            buckets.append(Bucket(index=i, requests=0, active_load=1))
+
+        assert find_breaking_point(buckets, sustained_buckets=2) is None
+
+    def test_stall_after_first_empty_second_not_yet_flagged(self):
+        # A single empty second alone (gap=1) must not trigger even at a
+        # near-zero baseline latency - the 1-second bucket granularity means
+        # gap=1 is the noise floor, not yet a signal.
+        buckets = [Bucket(index=0, requests=100, successes=100, active_load=10)]
+        buckets[0].latencies = [0.01] * 100
+        buckets.append(Bucket(index=1, requests=0, active_load=10))
+        assert find_breaking_point(buckets, sustained_buckets=2) is None
+
 
 class TestTokenBucketLimiter:
     def test_default_capacity_equals_rps(self):
