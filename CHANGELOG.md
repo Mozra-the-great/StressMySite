@@ -20,3 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Unit tests (`tests/test_stats.py`) for the pure helper functions (URL
   normalization, percentile math, ramp-up scheduling, breaking-point
   detection, report formatting, rate limiter, config validation).
+
+### Security
+
+- `requirements.txt`: bumped the `aiohttp` floor from `>=3.9` to `>=3.10.11`
+  to exclude versions vulnerable to CVE-2024-23829 and CVE-2024-52304
+  (HTTP request-smuggling via the response parser).
