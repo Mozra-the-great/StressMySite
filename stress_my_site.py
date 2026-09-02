@@ -449,11 +449,26 @@ def build_report(
     breaking_point: Optional[BreakingPoint],
     requests_outcome: Optional[RequestsModeOutcome] = None,
     takedown_outcome: Optional[TakedownOutcome] = None,
+    verify_tls: bool = True,
 ) -> str:
-    """Format the final human-readable report from raw run statistics."""
+    """Format the final human-readable report from raw run statistics.
+
+    `verify_tls` is reported rather than merely acted on: a saved or shared
+    report otherwise gives no way to tell after the fact whether certificate
+    validation was on, which makes it non-auditable with respect to TLS posture
+    and can lend misplaced confidence to numbers gathered over an intercepted or
+    misrouted connection (#26). It defaults to True so existing callers (and
+    tests) that predate the flag keep describing the default posture correctly.
+    """
     lines: list[str] = []
     lines.append("=" * 60)
     lines.append(f"Target:            {stats.url}")
+    # An http:// target has no certificate to validate, so neither "enabled" nor
+    # "disabled" would be true there - --insecure is simply inert.
+    if stats.url.lower().startswith("https://"):
+        lines.append(f"TLS verification:  {'enabled' if verify_tls else 'DISABLED (--insecure)'}")
+    else:
+        lines.append("TLS verification:  n/a (plain http target)")
     lines.append(f"Duration:          {stats.duration:.2f}s")
     lines.append(f"Total requests:    {stats.total_requests}")
     if stats.total_requests:
@@ -1156,6 +1171,18 @@ def build_config_from_args(args: argparse.Namespace) -> RunConfig:
     if args.timeout <= 0:
         raise ValueError("--timeout must be a positive number of seconds")
 
+    # Mirrors the --max-concurrency default notice: a flag that silently changes
+    # the run's security posture for its whole duration should say so once, out
+    # loud. The realistic failure mode is an alias or script built for a homelab
+    # self-signed cert being reused later against a different target (#26).
+    if args.insecure:
+        print(
+            "[warning] TLS certificate verification is DISABLED for this entire run (--insecure) - "
+            "results say nothing about the target's certificate, and traffic could be "
+            "intercepted or misrouted without any indication here",
+            file=sys.stderr,
+        )
+
     if mode == "break":
         return _build_break_config(args, url, concurrency)
     if mode == "requests":
@@ -1318,7 +1345,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     breaking_point = find_breaking_point(generator.stats.buckets)
     print()
-    print(build_report(generator.stats, breaking_point, generator.requests_outcome, generator.takedown_outcome))
+    print(build_report(generator.stats, breaking_point, generator.requests_outcome, generator.takedown_outcome, verify_tls=config.verify_tls))
     return 130 if interrupted else 0
 
 
