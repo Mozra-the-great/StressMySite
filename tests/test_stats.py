@@ -407,6 +407,31 @@ class TestBuildConfigValidation:
         with pytest.raises(SystemExit):
             parse_args(["bogus-mode", "--url", "https://example.com", "-y"])
 
+    # #26: --insecure silently turned certificate validation off for the whole run,
+    # with nothing said at runtime and nothing recorded in the report.
+    def test_insecure_warns_on_stderr(self, capsys):
+        args = parse_args(["break", "--url", "https://example.com", "-c", "5", "--insecure", "-y"])
+        config = build_config_from_args(args)
+        assert config.verify_tls is False
+        err = capsys.readouterr().err
+        assert "--insecure" in err
+        assert "DISABLED" in err
+
+    def test_no_insecure_warning_without_the_flag(self, capsys):
+        args = parse_args(["break", "--url", "https://example.com", "-c", "5", "-y"])
+        config = build_config_from_args(args)
+        assert config.verify_tls is True
+        assert "--insecure" not in capsys.readouterr().err
+
+    def test_insecure_warns_for_every_mode(self, capsys):
+        for argv in (
+            ["break", "--url", "https://example.com", "-c", "5", "--insecure", "-y"],
+            ["requests", "--url", "https://example.com", "-c", "5", "--target-rps", "50", "--insecure", "-y"],
+            ["takedown", "--url", "https://example.com", "-c", "5", "-m", "1", "--insecure", "-y"],
+        ):
+            build_config_from_args(parse_args(argv))
+            assert "--insecure" in capsys.readouterr().err, argv[0]
+
     class TestBreakMode:
         def test_max_concurrency_defaults_to_200x_concurrency(self):
             args = parse_args(["break", "--url", "https://example.com", "-c", "10", "-y"])
@@ -579,6 +604,24 @@ class TestBuildReport:
         assert "200:" in report
         assert "p95:" in report
         assert "No breaking point detected" in report
+
+    def test_report_records_tls_verification_state(self):
+        stats = RunStats(url="https://example.com")
+        stats.duration = 1.0
+
+        assert "TLS verification:  enabled" in build_report(stats, None)
+        assert "TLS verification:  enabled" in build_report(stats, None, verify_tls=True)
+        assert "TLS verification:  DISABLED (--insecure)" in build_report(stats, None, verify_tls=False)
+
+    def test_report_calls_tls_n_a_for_a_plain_http_target(self):
+        # http:// has no certificate to validate, so --insecure is inert there and
+        # neither "enabled" nor "disabled" would be a true statement.
+        stats = RunStats(url="http://localhost:8080")
+        stats.duration = 1.0
+
+        for verify in (True, False):
+            report = build_report(stats, None, verify_tls=verify)
+            assert "TLS verification:  n/a (plain http target)" in report
 
     def test_report_shows_breaking_point(self):
         from stress_my_site import BreakingPoint
