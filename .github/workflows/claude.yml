@@ -5,8 +5,9 @@ name: Claude Code
 #
 # OPTIONAL BY DEFAULT: without the CLAUDE_CODE_OAUTH_TOKEN secret the "Check token"
 # step reports enabled=false, every later step is skipped and the job ends green
-# instead of failing red on a mention. The action itself only answers users with
-# write access to the repository.
+# instead of failing red on a mention. Only OWNER/MEMBER/COLLABORATOR mentions
+# start the job at all (job-level `if:` on author_association); the action itself
+# additionally only answers users with write access to the repository.
 
 on:
   issue_comment:
@@ -22,11 +23,18 @@ permissions: {}
 
 jobs:
   claude:
+    # Defense in depth: only OWNER/MEMBER/COLLABORATOR may trigger the job, so
+    # drive-by mentions on a public repo never even start a runner. The action's
+    # own write-permission check stays as the second layer. Exactly one of the
+    # three author_association fields is set per event.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || github.event.review.author_association || github.event.issue.author_association) &&
+      (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read

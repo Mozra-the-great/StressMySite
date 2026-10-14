@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- `claude.yml`: the job only starts for `@claude` mentions from an `OWNER`,
+  `MEMBER` or `COLLABORATOR` (job-level `author_association` gate), so drive-by
+  mentions on a public repo cannot start a run. Restores the gate from PR #14
+  that the template sync (#36) had dropped.
 - `requirements.txt`: bumped the `aiohttp` floor from `>=3.9` to `>=3.10.11`
   to exclude versions vulnerable to CVE-2024-23829 and CVE-2024-52304
   (HTTP request-smuggling via the response parser).
