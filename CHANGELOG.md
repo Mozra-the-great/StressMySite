@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   normalization, percentile math, ramp-up scheduling, breaking-point
   detection, report formatting, rate limiter, config validation).
 
+- CI: `ci.yml` (required check `build`: `ruff check` plus `pytest` on Python
+  3.10 and 3.13), `workflow-lint.yml` (actionlint, zizmor), `secret-scan.yml`
+  (gitleaks over the PR diff); `tests/test_cli_smoke.py` runs `--help` for the
+  CLI and every subcommand; `ruff.toml` and `requirements-dev.txt`.
+
+### Changed
+
+- Documented minimum Python version is now 3.10 (`aiohttp>=3.14.4` requires
+  it); `CLAUDE.md` and `README.md` previously still said 3.9+.
+- Claude workflows synced with the hardened `repo-template-public` versions
+  (skip cleanly without the `CLAUDE_CODE_OAUTH_TOKEN` secret; the review check
+  fails on findings); Dependabot got a 7-day cooldown and commit prefixes.
+
 ### Security
 
 - `requirements.txt`: bumped the `aiohttp` floor from `>=3.9` to `>=3.10.11`

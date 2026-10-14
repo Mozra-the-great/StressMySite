@@ -27,7 +27,7 @@ always stops automatically once `--minutes` elapses.
 
 ## Install
 
-Requires Python 3.9+ and Chrome/Chromium is **not** needed (there's no browser
+Requires Python 3.10+ and Chrome/Chromium is **not** needed (there's no browser
 involved).
 
 ```sh

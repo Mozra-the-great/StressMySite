@@ -1,11 +1,25 @@
 version: 2
+
+# Keeps the SHA-pinned actions in .github/workflows and the Python dependencies
+# fresh. cooldown: a new release is proposed only after 7 days, so a compromised
+# release is usually noticed before it reaches a PR. Dependabot cannot read
+# repository secrets, so the Claude jobs skip its PRs; merge its PRs only after
+# the `build` check ran on them.
 updates:
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(actions)"

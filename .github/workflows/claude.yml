@@ -1,5 +1,13 @@
 name: Claude Code
 
+# Reacts to "@claude" in issues, PR comments and PR reviews. Runs only on such a
+# mention, so it costs nothing until someone asks.
+#
+# OPTIONAL BY DEFAULT: without the CLAUDE_CODE_OAUTH_TOKEN secret the "Check token"
+# step reports enabled=false, every later step is skipped and the job ends green
+# instead of failing red on a mention. The action itself only answers users with
+# write access to the repository.
+
 on:
   issue_comment:
     types: [created]
@@ -10,16 +18,15 @@ on:
   pull_request_review:
     types: [submitted]
 
+permissions: {}
+
 jobs:
   claude:
     if: |
-      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || github.event.review.author_association || github.event.issue.author_association) &&
-      (
-        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
-      )
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -28,13 +35,32 @@ jobs:
       id-token: write
       actions: read # Required for Claude to read CI results on PRs
     steps:
+      # The `secrets` context is not available in a job-level `if:`, so presence is
+      # checked here via env. Never echo the value.
+      - name: Check token
+        id: gate
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "CLAUDE_CODE_OAUTH_TOKEN is not set - ignoring the @claude mention."
+          fi
+
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.enabled == 'true'
+        # The token stays persisted on purpose: Claude commits and pushes branches
+        # from this checkout when asked to implement something. Every other
+        # workflow in this repo sets persist-credentials: false.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1  # zizmor: ignore[artipacked]
         with:
           fetch-depth: 1
 
       - name: Run Claude Code
         id: claude
+        if: steps.gate.outputs.enabled == 'true'
         uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1.0.247
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -46,11 +72,7 @@ jobs:
           # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
           # prompt: 'Update the pull request description to include a summary of changes.'
 
-          # Least-privilege tool allowlist, matching the pattern already used in
-          # claude-code-review.yml. This is the interactive @claude workflow, so
-          # it needs a broader set than the review workflow (it also implements
-          # changes, commits, and pushes), but still enumerated rather than left
-          # as the action's unrestricted default. Bash covers git/gh invocations
-          # (matching the review workflow's own unscoped Bash entry) without the
-          # added quoting/escaping risk of per-subcommand scoping in YAML.
-          claude_args: '--allowedTools Skill,Bash,Read,Edit,Write,Grep,Glob'
+          # Optional: Add claude_args to customize behavior and configuration
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+          # claude_args: '--allowed-tools Bash(gh pr *)'

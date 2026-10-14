@@ -1,55 +1,218 @@
 name: Claude Code Review
 
+# OPTIONAL BY DEFAULT: the review only runs when the CLAUDE_CODE_OAUTH_TOKEN
+# secret exists in the repository. Without it (new repo, fork PR, Dependabot) the
+# "Check token" step reports enabled=false, every later step is skipped and the
+# job ends green at no cost. A green `claude-review` therefore means "skipped"
+# when the secret is absent, not "reviewed".
+#
+# Cost: every push to an open PR starts a full review that draws on the Claude
+# usage budget of the account behind the token (and on Actions minutes in a
+# private repo). Set the secret only in repos that receive real PRs.
+#
+# Hardened from the production versions in nagellacke (#312, #313, #315, #317)
+# and homelab-infra (#259); each comment below records the failure it prevents.
+
 on:
   pull_request:
+    # synchronize has to stay while claude-review is a required status check: GitHub
+    # evaluates required checks against the head commit, so a job that does not run on
+    # a pushed commit never reports there and the PR is blocked forever. Dropping it to
+    # save the per-run cost did exactly that to nagellacke #312. Remove it only
+    # together with claude-review's required-check entry in the ruleset.
+    #
+    # No `paths:` filter for the same reason (convention C1): a required check whose
+    # workflow does not start stays pending forever. Skip with a job-level `if`.
     types: [opened, synchronize, ready_for_review, reopened]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+
+# The "Fail on findings" step counts Claude's comments from the start of ITS run.
+# Two concurrent runs on the same PR would attribute each other's findings, and the
+# older one reviews a commit that is no longer the head anyway.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   claude-review:
-    # Skip Dependabot PRs — the bot cannot access repository secrets
+    # Skip Dependabot PRs: GitHub withholds secrets from Dependabot events, so the
+    # action would receive an empty token and fail with "Environment variable
+    # validation failed" (homelab-infra #199). A job skipped through `if` counts as
+    # passing for required checks.
     if: github.actor != 'dependabot[bot]'
 
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write # required to post the review comment - read-only caused every run to fail with a permission denial
+      # read is enough, and matches the documented example: the review posts through
+      # the Claude GitHub App, which carries its own write access, not through this
+      # job's GITHUB_TOKEN. These were briefly widened to write on the theory that
+      # missing permissions were why the review never commented; the execution logs
+      # disproved that (zero denials), and nagellacke #317 confirmed it by posting
+      # three inline comments once the claude_args allowlist below was in place.
+      pull-requests: read
       issues: read
       id-token: write
 
     steps:
+      # The `secrets` context is not available in a job-level `if:` (that makes the
+      # workflow invalid), so presence is checked here via env. Never echo the value.
+      - name: Check token
+        id: gate
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "CLAUDE_CODE_OAUTH_TOKEN is not set - skipping the review."
+          fi
+
       - name: Checkout repository
+        if: steps.gate.outputs.enabled == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
+
+      # From here on, "Fail on findings" counts comments as this run's result.
+      - name: Record start time
+        id: start
+        if: steps.gate.outputs.enabled == 'true'
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code Review
         id: claude-review
+        if: steps.gate.outputs.enabled == 'true'
         uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1.0.247
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          # --comment is required to actually post findings as inline PR
-          # comments - without it, the skill only returns findings as plain
-          # text output, which is never surfaced anywhere in a headless CI
-          # run (the previous config ran "successfully" but posted nothing).
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
+          # --comment is what makes the review visible. Without it the plugin writes its
+          # findings only into its own execution log, which is discarded with the runner:
+          # the nagellacke #313 run reviewed the diff properly across 27 turns and still
+          # posted nothing, closing with "No --comment flag was passed, so no GitHub
+          # comments were posted."
+          # The skill's step 1 skips a PR that Claude has already commented on, which
+          # makes the review one-shot: push a fix and it declines to look again. That
+          # is the wrong default here, since `synchronize` is in the trigger precisely
+          # so a fix gets re-checked. The extra instructions lift that one condition
+          # and keep the rest, and tell it to read the existing threads first so a
+          # re-review does not re-post findings that are already open - which matters
+          # doubly because unresolved threads block merging in the ruleset.
+          # The last two paragraphs force inline threads. The plugin falls back to a
+          # plain PR comment when a finding concerns a line outside the diff, and a
+          # plain comment is nothing the thread rule can hold the merge on - that is
+          # how homelab-infra #259 auto-merged 45 s after its review flagged a stale
+          # README line.
+          prompt: |
+            /code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+
+            This workflow runs on every push to an open pull request, and re-reviewing
+            after a fix is the intent. In step 1, do not treat "Claude has already
+            commented on this PR" as a reason to skip. Every other skip condition still
+            applies: closed, draft, and changes too trivial to need review.
+
+            You may have reviewed an earlier commit of this PR. Read the existing review
+            comments before you post anything, and do not repeat a finding that an open
+            thread already covers. Comment only on what is new in the latest commits, or
+            on a previously reported issue whose attempted fix does not actually resolve
+            it - and in that case say what is still wrong with it.
+
+            Post every finding as an inline comment with
+            mcp__github_inline_comment__create_inline_comment, never as a general PR
+            comment - not even when it concerns a file or line outside the diff (such as
+            documentation the change should have updated). In that case anchor it to the
+            changed line that causes the finding and name the affected file and line in
+            the text. Only open inline threads hold the merge. `gh pr comment` is for the
+            all-clear alone, and that starts verbatim with "No issues found" or
+            "No new issues found".
+
+            Any other comment you post in this run fails the check. So do not reply in a
+            thread just to confirm that a fix works. A thread the author resolved without
+            a code change was dismissed on purpose: do not raise that point again.
           allowed_bots: 'claude[bot]'
-          # Without an explicit allowlist, any tool call has no way to get
-          # interactively approved in a non-interactive CI run and is
-          # auto-denied. Skill is required first - the prompt's very first
-          # action is invoking the code-review:code-review skill itself, and
-          # without it listed here that call was denied immediately, causing
-          # the agent to improvise a partial review via ad hoc subagents
-          # instead (and never finish, hence zero comments posted despite
-          # completing "successfully"). Bash/Read/Grep/Glob are what the
-          # skill needs once it's actually running to inspect the diff.
-          claude_args: '--allowedTools Skill,Bash,Read,Grep,Glob'
+          # The review used to delegate its first step to a background subagent and then
+          # end its turn waiting for the result. In a one-shot CI run nothing can deliver
+          # that result - the run ends with the turn - so it exited "success" after 6
+          # turns having never looked at the diff (nagellacke #312: Agent started, then
+          # ScheduleWakeup, sleep 1, a blocked sleep 30, and "I'll just wait for the
+          # automatic notification"). A bare tool name in --disallowedTools removes the
+          # tool from the model's context entirely, so the same work happens inline
+          # instead of being handed off. Task is the older name for Agent; ScheduleWakeup
+          # is the stalling mechanism it reached for next.
+          # --allowedTools is not a formality here: the action starts the MCP server that
+          # posts inline comments ONLY when claude_args names its tool, so without this
+          # line the tool is absent from the session and the review has nothing to post
+          # with. The nagellacke #315 run found three real bugs, could not reach that
+          # tool, fell back to `gh api`, and was blocked there as a mutating call - so it
+          # reported nothing. The skill's own allowed-tools frontmatter naming the tool
+          # is not enough; the docs are explicit that this line must be kept anyway.
+          claude_args: |
+            --disallowedTools "Agent,Task,ScheduleWakeup"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment"
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
+
+      # The action writes a turn-by-turn log - including which tool calls were denied and
+      # why - to a file that is otherwise thrown away with the runner. Without it a review
+      # that *could not* post is indistinguishable from one that had nothing to say, which
+      # is what made the permissions problem above invisible for two PRs.
+      - name: Collect execution log
+        if: always() && steps.gate.outputs.enabled == 'true'
+        env:
+          EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+        run: |
+          src="$EXECUTION_FILE"
+          # Fall back to the path the action logs when the output is not set.
+          [ -n "$src" ] && [ -f "$src" ] || src="${RUNNER_TEMP}/claude-execution-output.json"
+          if [ -f "$src" ]; then
+            cp "$src" "${RUNNER_TEMP}/claude-review-log.json"
+          else
+            echo "No execution log found (looked at: $src)"
+          fi
+
+      - name: Upload execution log
+        if: always() && steps.gate.outputs.enabled == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: claude-review-log
+          path: ${{ runner.temp }}/claude-review-log.json
+          if-no-files-found: warn
+
+      # The action ends green whenever the review runs without error, whatever it found,
+      # so as a required check claude-review only meant "a review happened". This step
+      # makes it mean "nothing was found": every claude[bot] comment since the run
+      # started is a finding, except the "No (new) issues found" all-clear.
+      #
+      # False positive: resolve the thread without a code change (the prompt treats that
+      # as dismissed) and re-run the job. The rulesets have no bypass, so there is no
+      # other way to merge.
+      - name: Fail on findings
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.at }}
+        run: |
+          set -euo pipefail
+          # Inline comments and replies in threads.
+          inline=$(gh api --paginate "repos/$REPO/pulls/$PR/comments?since=$SINCE" \
+            --jq '.[] | select(.user.login == "claude[bot]" and .created_at >= env.SINCE) | .html_url')
+          # General comments, except the plugin's all-clear.
+          general=$(gh api --paginate "repos/$REPO/issues/$PR/comments?since=$SINCE" \
+            --jq '.[] | select(.user.login == "claude[bot]" and .updated_at >= env.SINCE)
+                  | select(.body | test("No (new )?issues found"; "i") | not) | .html_url')
+          findings=$(printf '%s\n%s\n' "$inline" "$general" | sed '/^$/d')
+          if [ -n "$findings" ]; then
+            count=$(printf '%s\n' "$findings" | wc -l)
+            echo "::error title=Claude review::${count} finding(s) in this run." \
+              "Fix and push, or for a false positive resolve the thread and re-run the job."
+            printf '%s\n' "$findings"
+            exit 1
+          fi
+          echo "No findings in this run."
