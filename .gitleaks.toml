@@ -1,0 +1,19 @@
+# gitleaks configuration, used by .github/workflows/secret-scan.yml and usable as a
+# pre-commit hook (see docs/TEMPLATE-SETUP.md).
+#
+# Extends the gitleaks default ruleset (>150 patterns: cloud API keys, JWTs,
+# private keys, generic password assignments, ...) plus entropy detection for
+# unknown secrets.
+
+[extend]
+useDefault = true
+
+# Add project-specific rules or allowlists below. Keep allowlists as narrow as
+# possible (a single path or a single fingerprint), never a whole directory of
+# code. Example for a file of deliberately fake test credentials:
+#
+# [allowlist]
+# description = "Fake credentials used by the unit tests"
+# paths = [
+#   '''^tests/fixtures/fake-credentials\.txt$''',
+# ]

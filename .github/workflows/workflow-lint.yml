@@ -1,0 +1,71 @@
+name: Workflow Lint
+
+# actionlint finds syntax and type errors in workflows (and runs ShellCheck over
+# every `run:` block); zizmor finds security problems: template injection, risky
+# triggers, leftover checkout tokens, unpinned or vulnerable actions. Both run as
+# pinned release binaries with a checksum, not as third-party actions.
+#
+# Runs on every PR and push without a `paths:` filter (convention C1), so the
+# `workflow-lint` job can be a required status check. Justified exceptions are
+# marked in place with `# zizmor: ignore[<audit>]`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow-lint-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workflow-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint, zizmor and ShellCheck
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ZIZMOR_VERSION: 1.30.1
+          ZIZMOR_SHA256: e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a
+          # actionlint runs ShellCheck over every run: block when one is available.
+          # The one preinstalled on the runner image changes with the image; pinned,
+          # the job reports the same locally and in CI.
+          SHELLCHECK_VERSION: 0.11.0
+          SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+        run: |
+          set -euo pipefail
+          s="shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+          curl -sSfL -o "$s" "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${s}"
+          echo "${SHELLCHECK_SHA256}  ${s}" | sha256sum -c -
+          tar -xzf "$s" --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          ./shellcheck --version
+          a="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o "$a" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${a}"
+          echo "${ACTIONLINT_SHA256}  ${a}" | sha256sum -c -
+          tar -xzf "$a" actionlint
+          z="zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSfL -o "$z" "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/${z}"
+          echo "${ZIZMOR_SHA256}  ${z}" | sha256sum -c -
+          tar -xzf "$z" zizmor
+          ./actionlint -version
+          ./zizmor --version
+      - name: actionlint
+        run: ./actionlint -color -shellcheck ./shellcheck
+      # With a token the online audits run too (known-vulnerable actions, pins that
+      # point at foreign commits); the token is read-only.
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # `.` instead of just .github/workflows: that way zizmor also checks
+        # dependabot.yml (e.g. the cooldown for new releases).
+        run: ./zizmor --format github .

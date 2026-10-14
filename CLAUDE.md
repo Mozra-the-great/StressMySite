@@ -6,14 +6,18 @@
 CLI tool (HTTP load/stress tester).
 
 ## Stack
-Python 3.9+, `asyncio` + `aiohttp` for concurrent request generation, `pytest` for tests. No web framework, no database, no build step.
+Python 3.10+, `asyncio` + `aiohttp` for concurrent request generation, `pytest` for tests. No web framework, no database, no build step.
 
 ## Structure
 ```
 stress_my_site.py   - entire tool: pure helpers, async load generator, CLI
 tests/
   test_stats.py      - unit tests for the pure helpers (no network involved)
+  test_cli_smoke.py  - `--help` smoke tests for the CLI entry point (no network)
 requirements.txt     - runtime dependency (aiohttp)
+requirements-dev.txt - runtime + test/lint tooling (pytest, ruff)
+ruff.toml            - minimal lint ruleset (bugs only, no formatting rules)
+.github/workflows/   - ci (required check `build`: ruff + pytest on 3.10/3.13), workflow-lint, secret-scan, Claude review/assistant
 ```
 
 ## Commands
@@ -23,7 +27,9 @@ python stress_my_site.py                                          # interactive 
 python stress_my_site.py break --url https://example.com -c 50
 python stress_my_site.py requests --url http://localhost:8080 --target-rps 500
 python stress_my_site.py takedown --url http://localhost:8080 -m 5
+pip install -r requirements-dev.txt                                # test + lint tooling
 python -m pytest tests/ -v                                         # run unit tests
+ruff check .                                                       # lint
 ```
 
 ## Notes
