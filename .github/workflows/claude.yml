@@ -80,7 +80,12 @@ jobs:
           # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
           # prompt: 'Update the pull request description to include a summary of changes.'
 
-          # Optional: Add claude_args to customize behavior and configuration
+          # Explicit tool allowlist instead of the action's unrestricted default.
+          # This is the interactive @claude workflow, so it needs a broad set (it
+          # also implements changes, commits and pushes), but it stays enumerated.
+          # Bash is deliberately unscoped (git/gh and the repo's own test/lint
+          # commands) to avoid quoting/escaping pitfalls of per-subcommand scoping
+          # in YAML.
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
+          claude_args: '--allowedTools Skill,Bash,Read,Edit,Write,Grep,Glob'
