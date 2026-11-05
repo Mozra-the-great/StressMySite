@@ -4,11 +4,8 @@
 
 Please **do not** open a public issue for security vulnerabilities.
 
-Instead, report privately via:
-
-- GitHub: use the repo's "Report a vulnerability" button under the Security
-  tab (private Security Advisory), if enabled, **or**
-- Email: moritzbenjamin.schran@gmail.com
+Instead, report privately via GitHub: use the repo's "Report a vulnerability"
+button under the Security tab (private Security Advisory).
 
 Include what you found, steps to reproduce, and the potential impact. Expect
 an initial response within a few days — this is a personal-scale project
