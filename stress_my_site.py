@@ -137,9 +137,10 @@ def percentile(sorted_values: list[float], p: float) -> float:
     if len(sorted_values) == 1:
         return sorted_values[0]
 
-    rank = (p / 100) * (len(sorted_values) - 1)
+    n = len(sorted_values)
+    rank = (p / 100) * n
     lower = int(rank)
-    upper = min(lower + 1, len(sorted_values) - 1)
+    upper = lower + 1
     fraction = rank - lower
     return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * fraction
 
