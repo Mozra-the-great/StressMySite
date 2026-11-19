@@ -86,6 +86,9 @@ jobs:
       - name: Run Claude Code Review
         id: claude-review
         if: steps.gate.outputs.enabled == 'true'
+        env:
+          # Subagents must block until done; see the claude_args comment below.
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'
         uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -134,16 +137,25 @@ jobs:
             Any other comment you post in this run fails the check. So do not reply in a
             thread just to confirm that a fix works. A thread the author resolved without
             a code change was dismissed on purpose: do not raise that point again.
+
+            This is a one-shot CI run: it ends when your turn ends, and nothing can
+            deliver a result to you afterwards. Launch every subagent in the foreground
+            and wait for its result in the same turn, never in the background. Pass each
+            subagent the PR number and repository so it can run `gh pr diff` and
+            `gh pr view` itself.
           allowed_bots: 'claude[bot]'
-          # The review used to delegate its first step to a background subagent and then
-          # end its turn waiting for the result. In a one-shot CI run nothing can deliver
-          # that result - the run ends with the turn - so it exited "success" after 6
-          # turns having never looked at the diff (nagellacke #312: Agent started, then
-          # ScheduleWakeup, sleep 1, a blocked sleep 30, and "I'll just wait for the
-          # automatic notification"). A bare tool name in --disallowedTools removes the
-          # tool from the model's context entirely, so the same work happens inline
-          # instead of being handed off. Task is the older name for Agent; ScheduleWakeup
-          # is the stalling mechanism it reached for next.
+          # Subagents are allowed again, so the plugin can run its intended model mix
+          # (haiku pre-check, sonnet CLAUDE.md audits, opus bug hunt and validation)
+          # instead of one model doing every step inline.
+          # What went wrong before was not the subagent itself but running it in the
+          # BACKGROUND: the review delegated its first step, then ended its turn waiting
+          # for a result that a one-shot CI run can never deliver, and exited "success"
+          # after 6 turns without looking at the diff (nagellacke #312: Agent started,
+          # then ScheduleWakeup, sleep 1, a blocked sleep 30, and "I'll just wait for the
+          # automatic notification"). CLAUDE_CODE_DISABLE_BACKGROUND_TASKS (step env
+          # below) removes background execution, so every Agent call blocks until its
+          # result is back. ScheduleWakeup and Monitor stay removed as the waiting
+          # mechanisms it reached for next; the prompt repeats the rule.
           # --allowedTools is not a formality here: the action starts the MCP server that
           # posts inline comments ONLY when claude_args names its tool, so without this
           # line the tool is absent from the session and the review has nothing to post
@@ -152,8 +164,8 @@ jobs:
           # reported nothing. The skill's own allowed-tools frontmatter naming the tool
           # is not enough; the docs are explicit that this line must be kept anyway.
           claude_args: |
-            --disallowedTools "Agent,Task,ScheduleWakeup"
-            --allowedTools "mcp__github_inline_comment__create_inline_comment"
+            --disallowedTools "ScheduleWakeup,Monitor"
+            --allowedTools "Agent,mcp__github_inline_comment__create_inline_comment"
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
