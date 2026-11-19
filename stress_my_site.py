@@ -132,13 +132,13 @@ def percentile(sorted_values: list[float], p: float) -> float:
     """
     if not sorted_values:
         raise ValueError("cannot compute a percentile of an empty sequence")
-    if not 0 <= p <= 100:
+    if p < 0 or p > 100:
         raise ValueError("p must be between 0 and 100")
     if len(sorted_values) == 1:
         return sorted_values[0]
 
     rank = (p / 100) * (len(sorted_values) - 1)
-    lower = int(rank)
+    lower = math.floor(rank)
     upper = min(lower + 1, len(sorted_values) - 1)
     fraction = rank - lower
     return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * fraction
