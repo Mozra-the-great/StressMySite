@@ -224,7 +224,7 @@ def next_concurrency(current: int, measured_rps: float, target_rps: float, ceili
     if ceiling < current:
         raise ValueError("ceiling must be >= current")
     if measured_rps <= 0:
-        candidate = current * 2
+        candidate = current
     else:
         ratio = min(target_rps / measured_rps, 2.0)
         candidate = math.ceil(current * ratio)
