@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
+import os
 import re
 import statistics
 import sys
@@ -463,6 +464,9 @@ def build_report(
     lines: list[str] = []
     lines.append("=" * 60)
     lines.append(f"Target:            {stats.url}")
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    if proxy:
+        lines.append(f"Proxy:             {proxy}")
     # An http:// target has no certificate to validate, so neither "enabled" nor
     # "disabled" would be true there - --insecure is simply inert.
     if stats.url.lower().startswith("https://"):
