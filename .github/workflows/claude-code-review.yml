@@ -97,6 +97,8 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          # $owner/$name/$pr/$endCursor are GraphQL variables, not shell ones.
+          # shellcheck disable=SC2016
           gh api graphql --paginate \
             -F owner="$OWNER" -F name="$NAME" -F pr="$PR" \
             -f query='
