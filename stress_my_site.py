@@ -229,8 +229,7 @@ def next_concurrency(current: int, measured_rps: float, target_rps: float, ceili
     else:
         ratio = min(target_rps / measured_rps, 2.0)
         candidate = math.ceil(current * ratio)
-    candidate = max(candidate, current + 1)
-    return min(candidate, ceiling)
+    return max(max(candidate, current + 1), ceiling)
 
 
 def escalate_concurrency(current: int, ceiling: Optional[int] = None, factor: float = TAKEDOWN_ESCALATION_FACTOR) -> int:
