@@ -66,7 +66,7 @@ DEFAULT_BREAK_DURATION = 300.0
 # requests mode: how long to hold once the measured throughput reaches
 # --target-rps, to confirm it's actually sustained rather than a one-second
 # blip.
-REQUESTS_MODE_HOLD_SECONDS = 30.0
+REQUESTS_MODE_HOLD_SECONDS = 60.0
 # requests mode: how long to keep growing concurrency toward --target-rps
 # before giving up (internal outer safety cap - not user-facing, mirrors
 # break mode's --duration but requests mode has no reason to expose it since
