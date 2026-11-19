@@ -71,7 +71,7 @@ REQUESTS_MODE_HOLD_SECONDS = 30.0
 # before giving up (internal outer safety cap - not user-facing, mirrors
 # break mode's --duration but requests mode has no reason to expose it since
 # the ramp is throughput-driven, not time-driven).
-REQUESTS_MODE_RAMP_SAFETY = 120.0
+REQUESTS_MODE_RAMP_SAFETY = 180.0
 # Rough, deliberately conservative assumption used only to pick a sane
 # default --max-concurrency in requests mode when the user doesn't set one
 # explicitly: how many req/s a single worker can realistically sustain
