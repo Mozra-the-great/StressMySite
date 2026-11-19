@@ -5,9 +5,9 @@ name: Claude Code Review
 # orchestrator (Sonnet) only delegates, deduplicates and posts:
 #   review-triage      haiku   skip check + context (head SHA, guideline files)
 #   review-guidelines  sonnet  CLAUDE.md compliance
-#   review-bug-hunter  opus    2x in parallel, focus "diff" and "behaviour" (incl. docs
-#                              the change makes wrong)
+#   review-bug-hunter  opus    2x in parallel, focus "diff" and "behaviour"
 #   review-security    opus    security review after Anthropic's /security-review
+#   review-docs        sonnet  documentation the change makes wrong (README, CLAUDE.md, help)
 #   review-validator   opus    one per candidate finding, before anything is posted
 # Chosen after a four-round trial in StressMySite (#57-#63): the code-review
 # plugin let the orchestrator skip its subagents, and Anthropic's stock /review-pr
@@ -134,9 +134,9 @@ jobs:
             wait for its result in the same turn, never in the background.
 
             1. Run review-triage. If it returns SKIP: yes, stop without posting anything.
-            2. In one message, run four subagents in parallel: review-guidelines (with
+            2. In one message, run five subagents in parallel: review-guidelines (with
                the GUIDELINE_FILES from step 1), review-bug-hunter with FOCUS diff,
-               review-bug-hunter with FOCUS behaviour, and review-security.
+               review-bug-hunter with FOCUS behaviour, review-security, and review-docs.
             3. Merge their results and drop duplicates (same line and same cause).
             4. Read `.review-threads.json` in the repository root. Drop every candidate
                an open thread already covers, and every candidate matching a thread the
@@ -144,7 +144,8 @@ jobs:
                Keep a candidate whose earlier fix attempt does not actually resolve it.
             5. In one message, run one review-validator per remaining candidate, in
                parallel. Pass each candidate on in full; for a review-security finding
-               that includes its severity, category and exploit scenario. Keep only
+               that includes its severity, category and exploit scenario, for a
+               review-docs finding the stale file, line and quoted statement. Keep only
                CONFIRMED ones.
             6. Post each confirmed finding as an inline comment with
                mcp__github_inline_comment__create_inline_comment (confirmed: true) on the
