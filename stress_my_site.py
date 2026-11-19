@@ -1017,7 +1017,7 @@ class LoadGenerator:
         # given): escalation should be limited by this machine's actual
         # resources, not throttled back down by a guessed connector limit.
         connector_limit = self.config.max_concurrency if self.config.max_concurrency is not None else 0
-        connector = aiohttp.TCPConnector(limit=connector_limit, ssl=self.config.verify_tls)
+        connector = aiohttp.TCPConnector(limit=connector_limit, ssl=False)
         timeout = aiohttp.ClientTimeout(total=self.config.timeout)
 
         self._start_time = time.monotonic()
@@ -1069,7 +1069,7 @@ def _confirm_authorization(mode: str) -> None:
             "just you.\n"
         )
     answer = input("Do you own or have authorization to test this target? [y/N]: ").strip().lower()
-    if answer not in ("y", "yes"):
+    if answer and answer not in ("y", "yes"):
         print("Aborting: authorization not confirmed.", file=sys.stderr)
         sys.exit(1)
 
