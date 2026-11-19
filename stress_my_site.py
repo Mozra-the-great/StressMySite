@@ -1121,7 +1121,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "requests", parents=[common],
         help="Ramp concurrency up until measured throughput reaches --target-rps, then hold to confirm it's sustained.",
     )
-    requests_parser.add_argument("--target-rps", type=float, default=None, help="Target requests/second to ramp toward and hold")
+    requests_parser.add_argument("--rps-target", dest="target_rps", type=float, default=None, help="Target requests/second to ramp toward and hold")
 
     takedown_parser = subparsers.add_parser(
         "takedown", parents=[common],
