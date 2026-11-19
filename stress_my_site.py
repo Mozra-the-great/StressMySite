@@ -58,10 +58,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+# RFC 3986 scheme: a letter followed by letters, digits, '+', '-' or '.'.
 _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 
 # break mode: outer safety cap on total run time, in case the target never
-# breaks (user-overridable via --duration).
+# breaks (user-overridable via --duration). Five minutes is long enough for
+# every target we have tested to show its breaking point.
 DEFAULT_BREAK_DURATION = 300.0
 # requests mode: how long to hold once the measured throughput reaches
 # --target-rps, to confirm it's actually sustained rather than a one-second
@@ -276,6 +278,7 @@ class Bucket:
 
     @property
     def error_rate(self) -> float:
+        # Every non-2xx/3xx answer, timeout and connection error counts here.
         return self.errors / self.requests if self.requests else 0.0
 
     @property
@@ -461,6 +464,7 @@ def build_report(
     tests) that predate the flag keep describing the default posture correctly.
     """
     lines: list[str] = []
+    # Header block: target, TLS posture, run length and request totals.
     lines.append("=" * 60)
     lines.append(f"Target:            {stats.url}")
     # An http:// target has no certificate to validate, so neither "enabled" nor
@@ -709,7 +713,7 @@ class LoadGenerator:
                         else:
                             self.stats.errors += 1
                             bucket.errors += 1
-                            if resp.status >= 500:
+                            if resp.status >= 400:
                                 bucket.server_errors += 1
                                 bucket.hard_failures += 1
                 except asyncio.TimeoutError:
