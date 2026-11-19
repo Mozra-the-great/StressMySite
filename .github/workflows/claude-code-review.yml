@@ -40,7 +40,15 @@ jobs:
     # action would receive an empty token and fail with "Environment variable
     # validation failed" (homelab-infra #199). A job skipped through `if` counts as
     # passing for required checks.
-    if: github.actor != 'dependabot[bot]'
+    #
+    # TRIAL: PRs labelled review-trial-stock or review-trial-tiered are reviewed by
+    # claude-review-stock.yml / claude-review-tiered.yml instead. All three post as
+    # claude[bot], so running this one as well would mix the results. Remove these
+    # two conditions together with the trial workflows.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      !contains(github.event.pull_request.labels.*.name, 'review-trial-stock') &&
+      !contains(github.event.pull_request.labels.*.name, 'review-trial-tiered')
 
     runs-on: ubuntu-latest
     permissions:

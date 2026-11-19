@@ -1,17 +1,27 @@
 name: Claude Review (stock trial)
 
 # TRIAL, not a required check. Runs Anthropic's own PR-review setup from
-# anthropics/claude-code-action (.github/workflows/claude-review.yml at v1.0.283)
-# side by side with claude-code-review.yml, so both can be compared on the same PR.
-# The command and the five reviewer agents are copied verbatim into
+# anthropics/claude-code-action (.github/workflows/claude-review.yml at v1.0.283),
+# with the command and the five reviewer agents copied verbatim into
 # .claude/commands/review-pr.md and .claude/agents/*-reviewer.md.
 #
-# Deviations from upstream, each forced by this repo:
+# Round 3 showed the stock setup stalling exactly like nagellacke #312: it ran the
+# five reviewers as background tasks, called ScheduleWakeup after four of them,
+# ended its turn "waiting for the security reviewer" and posted nothing - green job,
+# 1.74 USD. Round 4 keeps the stock command and agents and adds only what that run
+# proved missing:
+# - CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, ScheduleWakeup/Monitor disallowed, and a
+#   prompt line requiring foreground subagents.
+# - A prompt line restricting top-level comments to the all-clear (stock asks for
+#   "observations or praise" there), plus "Fail on findings" so the result shows in
+#   the check.
+#
+# Other deviations from upstream, each forced by this repo:
 # - Auth: CLAUDE_CODE_OAUTH_TOKEN instead of Workload Identity Federation
 #   (no API organisation here), gated so the job is skipped without the secret.
 # - Runner: ubuntu-latest instead of Anthropic's internal egress-firewall runner.
 # - Trigger: also synchronize, so a push to a PR is reviewed again, and only on
-#   PRs labelled review-stock-trial (see the job's `if`).
+#   PRs labelled review-trial-stock (see the job's `if`).
 # - Model: current Opus instead of upstream's pinned claude-opus-4-7.
 # - Actions pinned to commit SHAs (workflow-lint), execution log uploaded.
 # Remove this file and the copied .claude files when the trial is over.
@@ -29,12 +39,12 @@ permissions: {}
 jobs:
   review:
     # Upstream skips fork PRs; Dependabot gets no secrets either.
-    # Opt-in per label: both workflows post as claude[bot], so on an ordinary PR the
-    # required claude-review's "Fail on findings" would count this trial's comments.
+    # Opt-in per label: all review workflows post as claude[bot], so their
+    # "Fail on findings" steps must never run on the same PR.
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'dependabot[bot]' &&
-      contains(github.event.pull_request.labels.*.name, 'review-stock-trial')
+      contains(github.event.pull_request.labels.*.name, 'review-trial-stock')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -60,19 +70,35 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Record start time
+        id: start
+        if: steps.gate.outputs.enabled == 'true'
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: PR Review with Progress Tracking
         id: review
         if: steps.gate.outputs.enabled == 'true'
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'
         uses: anthropics/claude-code-action@f431adaf77e0fecf918431e75a2b5b45b85af002 # v1.0.283
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: "/review-pr REPO: ${{ github.repository }} PR_NUMBER: ${{ github.event.pull_request.number }}"
+          prompt: |
+            /review-pr REPO: ${{ github.repository }} PR_NUMBER: ${{ github.event.pull_request.number }}
+
+            This is a one-shot CI run: it ends when your turn ends, and nothing can
+            deliver a result to you afterwards. Run every subagent in the foreground and
+            wait for its result in the same turn, never in the background.
+
+            Post every finding as an inline comment. Post no top-level comment except
+            the all-clear, which starts verbatim with "No issues found".
           # --permission-mode auto: a tool call that needs permission and is outside --allowedTools
           # below and the allowed-tools list in .claude/commands/review-pr.md runs only if Claude
           # Code's safety review passes it.
           claude_args: |
             --permission-mode auto
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
+            --disallowedTools "ScheduleWakeup,Monitor"
             --model "claude-opus-5-5"
 
       - name: Collect execution log
@@ -95,3 +121,28 @@ jobs:
           name: claude-review-stock-log
           path: ${{ runner.temp }}/claude-review-stock-log.json
           if-no-files-found: warn
+
+      # Same rule as claude-code-review.yml: every claude[bot] comment since the run
+      # started is a finding, except the "No (new) issues found" all-clear.
+      - name: Fail on findings
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.at }}
+        run: |
+          set -euo pipefail
+          inline=$(gh api --paginate "repos/$REPO/pulls/$PR/comments?since=$SINCE" \
+            --jq '.[] | select(.user.login == "claude[bot]" and .created_at >= env.SINCE) | .html_url')
+          general=$(gh api --paginate "repos/$REPO/issues/$PR/comments?since=$SINCE" \
+            --jq '.[] | select(.user.login == "claude[bot]" and .updated_at >= env.SINCE)
+                  | select(.body | test("No (new )?issues found"; "i") | not) | .html_url')
+          findings=$(printf '%s\n%s\n' "$inline" "$general" | sed '/^$/d')
+          if [ -n "$findings" ]; then
+            count=$(printf '%s\n' "$findings" | wc -l)
+            echo "::error title=Claude review::${count} finding(s) in this run."
+            printf '%s\n' "$findings"
+            exit 1
+          fi
+          echo "No findings in this run."
