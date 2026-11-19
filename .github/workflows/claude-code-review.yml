@@ -83,6 +83,42 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
+      # The prompt asks the review not to repeat open threads and not to re-raise
+      # dismissed ones, but `gh pr view --comments` shows no inline threads and every
+      # `gh api` call is denied in the session (a prefix rule for it would also admit
+      # mutating calls). So the threads are fetched here, read-only with this job's
+      # token, and handed over as a file the session can Read.
+      - name: Export existing review threads
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          NAME: ${{ github.event.repository.name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # $owner/$name/$pr/$endCursor are GraphQL variables, not shell ones.
+          # shellcheck disable=SC2016
+          gh api graphql --paginate \
+            -F owner="$OWNER" -F name="$NAME" -F pr="$PR" \
+            -f query='
+              query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 50, after: $endCursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        isResolved isOutdated path line
+                        comments(first: 20) { nodes { author { login } body createdAt } }
+                      }
+                    }
+                  }
+                }
+              }' \
+            --jq '.data.repository.pullRequest.reviewThreads.nodes[]' \
+            | jq -s '.' > "$GITHUB_WORKSPACE/.review-threads.json"
+          echo "Exported $(jq length "$GITHUB_WORKSPACE/.review-threads.json") review thread(s)."
+
       - name: Run Claude Code Review
         id: claude-review
         if: steps.gate.outputs.enabled == 'true'
@@ -120,7 +156,8 @@ jobs:
             applies: closed, draft, and changes too trivial to need review.
 
             You may have reviewed an earlier commit of this PR. Read the existing review
-            comments before you post anything, and do not repeat a finding that an open
+            threads in `.review-threads.json` (repository root; `isResolved` marks
+            resolved ones) before you post anything, and do not repeat a finding that an open
             thread already covers. Comment only on what is new in the latest commits, or
             on a previously reported issue whose attempted fix does not actually resolve
             it - and in that case say what is still wrong with it.
@@ -137,6 +174,12 @@ jobs:
             Any other comment you post in this run fails the check. So do not reply in a
             thread just to confirm that a fix works. A thread the author resolved without
             a code change was dismissed on purpose: do not raise that point again.
+
+            Follow the code-review steps literally, however small the change looks. Every
+            step that says "launch an agent" is a Task subagent call with the model the
+            step names (haiku, sonnet or opus), not something you do yourself; launch the
+            four reviewers of step 4 in parallel, and one validator per finding in step 5.
+            Only the final posting of comments is yours.
 
             This is a one-shot CI run: it ends when your turn ends, and nothing can
             deliver a result to you afterwards. Launch every subagent in the foreground
@@ -165,7 +208,7 @@ jobs:
           # is not enough; the docs are explicit that this line must be kept anyway.
           claude_args: |
             --disallowedTools "ScheduleWakeup,Monitor"
-            --allowedTools "Agent,mcp__github_inline_comment__create_inline_comment"
+            --allowedTools "Agent,Task,Read,Grep,Glob,Bash(gh pr view:*),Bash(gh pr diff:*),mcp__github_inline_comment__create_inline_comment"
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
