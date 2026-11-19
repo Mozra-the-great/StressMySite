@@ -1271,8 +1271,10 @@ def _build_takedown_config(args: argparse.Namespace, url: str, concurrency: int)
     minutes = args.minutes
     if minutes is None:
         minutes = float(_prompt("Minutes to hold the target down for once it breaks", "5"))
-    if minutes <= 0:
-        raise ValueError("--minutes must be a positive number")
+    if minutes == 0:
+        minutes = float("inf")  # 0 means: hold until Ctrl+C
+    if minutes < 0:
+        raise ValueError("--minutes must not be negative")
 
     max_concurrency = args.max_concurrency
     if max_concurrency is None:
