@@ -1069,7 +1069,7 @@ def _confirm_authorization(mode: str) -> None:
             "just you.\n"
         )
     answer = input("Do you own or have authorization to test this target? [y/N]: ").strip().lower()
-    if answer not in ("y", "yes"):
+    if answer not in {"y", "yes"}:
         print("Aborting: authorization not confirmed.", file=sys.stderr)
         sys.exit(1)
 
