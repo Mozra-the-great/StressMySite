@@ -5,7 +5,8 @@ name: Claude Code Review
 # orchestrator (Sonnet) only delegates, deduplicates and posts:
 #   review-triage      haiku   skip check + context (head SHA, guideline files)
 #   review-guidelines  sonnet  CLAUDE.md compliance
-#   review-bug-hunter  opus    2x in parallel, focus "diff" and "behaviour"
+#   review-bug-hunter  opus    2x in parallel, focus "diff" and "behaviour" (incl. docs
+#                              the change makes wrong)
 #   review-security    opus    security review after Anthropic's /security-review
 #   review-validator   opus    one per candidate finding, before anything is posted
 # Chosen after a four-round trial in StressMySite (#57-#63): the code-review

@@ -18,10 +18,18 @@ FOCUS `behaviour`: check the changed code against its contract - docstrings,
 callers, tests, and the intent stated in the PR - for logic errors, broken edge
 cases, error handling that no longer holds, and security problems in the new code.
 
+FOCUS `behaviour` also covers documentation the change makes wrong. For every
+changed constant, default, flag, command, file name or user-visible behaviour,
+Grep the README files, CLAUDE.md files, CONTRIBUTING, docs/, CLI help texts and
+docstrings for the old name or value, and report each statement that is now
+false. Anchor such a finding to the changed line that makes it false and name
+the stale file and line in the text.
+
 Report only HIGH-SIGNAL issues:
 - the code fails to parse, import or type-check, or
 - it produces a wrong result or crashes for inputs it is meant to handle, and you
-  can name a concrete input and the wrong outcome.
+  can name a concrete input and the wrong outcome, or
+- (FOCUS `behaviour`) a documentation statement is now false, and you can quote it.
 
 Do not report pre-existing problems, style, naming, missing tests, speculative
 risks that depend on unusual state, or anything a linter would flag. If you are
@@ -30,3 +38,9 @@ not sure an issue is real, leave it out.
 Return a list. For each issue: file, line in the new version, a one-line
 summary, the concrete failing input and outcome, and the fix in one sentence.
 If there is none, return exactly `NONE`.
+
+Working environment: the current directory is a checkout of this pull request
+(its merge commit), so the files there already contain the change - read them
+with Read, Grep and Glob. The only shell commands you need are `gh pr diff` and
+`gh pr view`. Run each on its own: no `cd`, pipes or chained commands, no
+`git fetch`, no `gh api`. Anything else is denied and only costs time.

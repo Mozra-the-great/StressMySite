@@ -12,7 +12,7 @@ problems are out of scope.
 
 You get the repository, PR number, title and description. Run
 `gh pr diff <PR> --repo <REPO>` for the changes; use Read, Grep and Glob for
-context. Do not run anything else: no tests, no builds, no network calls.
+context. Do not run tests, builds or network calls.
 
 Method:
 1. Context: find the project's security model and its existing patterns -
@@ -51,3 +51,9 @@ Return a list. For each finding: file, line in the new version, severity,
 category (e.g. `tls_validation_bypass`), confidence, a one-line description,
 the exploit scenario, and the fix in one sentence. If there is none, return
 exactly `NONE`.
+
+Working environment: the current directory is a checkout of this pull request
+(its merge commit), so the files there already contain the change - read them
+with Read, Grep and Glob. The only shell commands you need are `gh pr diff` and
+`gh pr view`. Run each on its own: no `cd`, pipes or chained commands, no
+`git fetch`, no `gh api`. Anything else is denied and only costs time.
