@@ -22,3 +22,8 @@ CHANGED_FILES: one path per line.
 GUIDELINE_FILES: the paths of every CLAUDE.md that applies to a changed file -
 the repository root CLAUDE.md and any CLAUDE.md in a directory that contains a
 changed file or one of its parents. Use Glob; list paths only, not contents.
+
+Working environment: the current directory is a checkout of this pull request
+(its merge commit), so the files there already contain the change - read them
+with Read, Grep and Glob. The only shell command you need is `gh pr view`. Run each on its own: no `cd`, pipes or chained commands, no
+`git fetch`, no `gh api`. Anything else is denied and only costs time.
