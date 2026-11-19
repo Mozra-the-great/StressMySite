@@ -18,18 +18,10 @@ FOCUS `behaviour`: check the changed code against its contract - docstrings,
 callers, tests, and the intent stated in the PR - for logic errors, broken edge
 cases, error handling that no longer holds, and security problems in the new code.
 
-FOCUS `behaviour` also covers documentation the change makes wrong. For every
-changed constant, default, flag, command, file name or user-visible behaviour,
-Grep the README files, CLAUDE.md files, CONTRIBUTING, docs/, CLI help texts and
-docstrings for the old name or value, and report each statement that is now
-false. Anchor such a finding to the changed line that makes it false and name
-the stale file and line in the text.
-
 Report only HIGH-SIGNAL issues:
 - the code fails to parse, import or type-check, or
 - it produces a wrong result or crashes for inputs it is meant to handle, and you
-  can name a concrete input and the wrong outcome, or
-- (FOCUS `behaviour`) a documentation statement is now false, and you can quote it.
+  can name a concrete input and the wrong outcome.
 
 Do not report pre-existing problems, style, naming, missing tests, speculative
 risks that depend on unusual state, or anything a linter would flag. If you are
