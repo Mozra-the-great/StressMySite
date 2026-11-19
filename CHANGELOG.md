@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- CI: `claude-review` is now a tiered Claude review. Agents with pinned models in
+  `.claude/agents/review-*.md`: haiku triage, sonnet CLAUDE.md and documentation
+  checks, two opus bug hunters, an opus security reviewer after Anthropic's
+  `/security-review`, and an opus validator per finding; Sonnet only orchestrates
+  and posts. Replaces the code-review plugin run.
 - Documented minimum Python version is now 3.10 (`aiohttp>=3.14.4` requires
   it); `CLAUDE.md` and `README.md` previously still said 3.9+.
 - Claude workflows synced with the hardened `repo-template-public` versions
