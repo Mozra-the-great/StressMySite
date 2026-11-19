@@ -49,7 +49,7 @@ latency, or throughput itself (see "Detecting a stall" below) crosses a
 threshold. Use this when the question is "where does this fall over?"
 
 **`requests`** ramps concurrency up until *measured* throughput reaches
-`--target-rps`, then holds there for 30s to confirm the rate is actually
+`--target-rps`, then holds there for 30 s to confirm the rate is actually
 sustained rather than a one-second blip. Use this when the question is "can
 this handle N requests/second?"
 
