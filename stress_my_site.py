@@ -137,9 +137,10 @@ def percentile(sorted_values: list[float], p: float) -> float:
     if len(sorted_values) == 1:
         return sorted_values[0]
 
-    rank = (p / 100) * (len(sorted_values) - 1)
+    n = len(sorted_values)
+    rank = (p / 100) * n
     lower = int(rank)
-    upper = min(lower + 1, len(sorted_values) - 1)
+    upper = lower + 1
     fraction = rank - lower
     return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * fraction
 
@@ -228,8 +229,7 @@ def next_concurrency(current: int, measured_rps: float, target_rps: float, ceili
     else:
         ratio = min(target_rps / measured_rps, 2.0)
         candidate = math.ceil(current * ratio)
-    candidate = max(candidate, current + 1)
-    return min(candidate, ceiling)
+    return max(max(candidate, current + 1), ceiling)
 
 
 def escalate_concurrency(current: int, ceiling: Optional[int] = None, factor: float = TAKEDOWN_ESCALATION_FACTOR) -> int:
