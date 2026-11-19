@@ -16,6 +16,10 @@ that file and really is broken.
 
 Reject the finding if it is pre-existing, if the code is in fact correct, if it
 depends on inputs the code is not meant to handle, or if it is a matter of style.
+For a security finding, also reject it unless the exploit scenario is concrete
+and reachable from input an attacker actually controls - environment variables
+and CLI flags are trusted - and it is not a denial of service, a missing
+hardening measure, or another class the security review excludes.
 
 Return exactly:
 VERDICT: CONFIRMED or REJECTED
